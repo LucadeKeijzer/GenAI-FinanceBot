@@ -1,7 +1,8 @@
 from src.data import fetch_historical_prices
-from src.features import compute_basic_metrics
+from src.forecast import generate_price_forecast
 
 df = fetch_historical_prices("BTC-USD")
-metrics = compute_basic_metrics(df)
+forecast = generate_price_forecast(df, forecast_days=30)
 
-print(metrics)
+print(forecast.head())
+print(forecast.tail())
