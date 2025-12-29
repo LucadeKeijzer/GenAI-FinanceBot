@@ -1,8 +1,11 @@
-from src.data import fetch_historical_prices
-from src.forecast import generate_price_forecast
+from src.pipeline import run_asset_pipeline
 
-df = fetch_historical_prices("BTC-USD")
-forecast = generate_price_forecast(df, forecast_days=30)
+WATCHLIST = ["BTC-USD", "ETH-USD", "SPY"]
 
-print(forecast.head())
-print(forecast.tail())
+results = []
+for symbol in WATCHLIST:
+    r = run_asset_pipeline(symbol, period="4y", forecast_days=30)
+    results.append(r)
+    print(symbol, r.metrics["trend"], r.metrics["last_price"])
+    print(r.forecast.head(2))
+    print("---")
