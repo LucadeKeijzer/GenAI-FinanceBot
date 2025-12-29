@@ -1,5 +1,7 @@
 from src.data import fetch_historical_prices
+from src.features import compute_basic_metrics
 
 df = fetch_historical_prices("BTC-USD")
-print(df.head())
-print(df.tail())
+metrics = compute_basic_metrics(df)
+
+print(metrics)
