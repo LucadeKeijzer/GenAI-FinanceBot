@@ -213,6 +213,27 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
         if actions[sym] in {"sell", "reduce"} and sym not in held:
             actions[sym] = "avoid"
 
+    # hard guardrail: sell/reduce only if held
+    for sym in allowed_symbols:
+        if actions[sym] in {"sell", "reduce"} and sym not in held:
+            actions[sym] = "avoid"
+
+    # soft consistency guardrail:
+    # if forecast is meaningfully negative, don't "consider/add" a NOT-held asset
+    asset_by_symbol = {a["symbol"]: a for a in evidence.get("assets", [])}
+    for sym in allowed_symbols:
+        a = asset_by_symbol.get(sym, {})
+        fc = a.get("forecast_change_pct", None)
+
+        try:
+            fc = float(fc)
+        except Exception:
+            continue
+
+        not_held = sym not in held
+        if not_held and fc < -0.02 and actions.get(sym) in {"consider", "add"}:
+            actions[sym] = "avoid"
+
     # --- confidence normalization ---
     conf = parsed.get("confidence", "medium")
     if not isinstance(conf, str):
