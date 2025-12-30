@@ -1,0 +1,9 @@
+# Local user-specific files
+user_settings.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
