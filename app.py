@@ -2,7 +2,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 from src.pipeline import run_asset_pipeline
-from src.llm import build_evidence_packet, call_ollama_json
+from src.llm import build_evidence_packet, run_ranker_llm, run_explainer_llm
 
 WATCHLIST = ["BTC-USD", "ETH-USD", "SPY"]
 PERIOD = "4y"
@@ -30,46 +30,80 @@ def plot_price_and_forecast(prices, forecast, symbol: str):
 
 
 def main():
-    st.set_page_config(page_title="FinanceBot v0.1", layout="wide")
-    st.title("FinanceBot v0.1 — Evidence-Based Analysis + GenAI Recommendation")
+    st.set_page_config(page_title="FinanceBot v0.2", layout="wide")
+    st.title("FinanceBot v0.2 — Evidence + GenAI Ranker + GenAI Explainer (Educational)")
 
     with st.spinner("Analyzing assets..."):
         results = compute_all_assets(WATCHLIST, PERIOD, FORECAST_DAYS)
 
-    with st.spinner("Generating GenAI recommendation..."):
-        evidence = build_evidence_packet(results)
-        genai_output, raw_llm = call_ollama_json(evidence, model=OLLAMA_MODEL)
+    # Build evidence once (used by both ranker and explainer)
+    evidence = build_evidence_packet(results)
+
+    with st.spinner("Generating GenAI ranking (Ranker)..."):
+        ranker_output, raw_ranker = run_ranker_llm(evidence, model=OLLAMA_MODEL)
+
+    final_ranking = ranker_output.get("ranking", [])
+    rec = ranker_output.get("recommended_symbol")
+    ranker_notes = ranker_output.get("ranker_notes", [])
+
+    with st.spinner("Generating explanation (Explainer)..."):
+        explainer_output, raw_explainer = run_explainer_llm(
+            final_ranking=final_ranking,
+            evidence=evidence,
+            recommended_symbol=rec,
+            ranker_notes=ranker_notes,
+            model=OLLAMA_MODEL
+        )
 
     st.subheader("📌 GenAI Investment Recommendation (Educational)")
 
-    rec = genai_output.get("recommended_symbol")
-    ranking = genai_output.get("ranking", [])
-    reasoning = genai_output.get("reasoning_bullets", [])
-    risks = genai_output.get("risks", [])
-    disclaimer = genai_output.get("disclaimer", "")
-
+    # ---- Ranker display ----
     if rec:
         st.markdown(f"### ✅ Suggested Focus: **{rec}**")
 
-    if ranking:
+    if final_ranking:
         st.write("**Asset ranking (best → worst):**")
-        st.write(" → ".join(ranking))
+        st.write(" → ".join(final_ranking))
 
-    if reasoning:
-        st.write("**Why this ranking was generated:**")
-        for bullet in reasoning:
+    if ranker_notes:
+        st.write("**Ranker notes (decision justification):**")
+        for bullet in ranker_notes:
             st.write(f"- {bullet}")
+
+    st.divider()
+
+    # ---- Explainer display ----
+    headline = explainer_output.get("headline", "")
+    explanation = explainer_output.get("explanation", [])
+    tradeoffs = explainer_output.get("key_tradeoffs", [])
+    risks = explainer_output.get("risks", [])
+    disclaimer = explainer_output.get("disclaimer", "")
+
+    if headline:
+        st.markdown(f"### 🧠 Explanation\n**{headline}**")
+    else:
+        st.markdown("### 🧠 Explanation")
+
+    if explanation:
+        for para in explanation:
+            st.write(f"- {para}")
+
+    if tradeoffs:
+        st.write("**Key tradeoffs:**")
+        for t in tradeoffs:
+            st.write(f"- {t}")
 
     if risks:
         st.write("**Risks & limitations:**")
-        for risk in risks:
-            st.write(f"- {risk}")
+        for r in risks:
+            st.write(f"- {r}")
 
     if disclaimer:
         st.caption(disclaimer)
 
     st.divider()
 
+    # ---- Evidence explorer ----
     symbol = st.selectbox("Explore an asset", WATCHLIST, index=0)
     r = results[symbol]
 
@@ -83,8 +117,12 @@ def main():
         st.subheader("Metrics")
         st.json(r.metrics)
 
-    with st.expander("🔍 Raw GenAI output (debug)"):
-        st.text(raw_llm)
+    # ---- Debug ----
+    with st.expander("🔍 Raw Ranker output (debug)"):
+        st.text(raw_ranker)
+
+    with st.expander("🔍 Raw Explainer output (debug)"):
+        st.text(raw_explainer)
 
 
 if __name__ == "__main__":

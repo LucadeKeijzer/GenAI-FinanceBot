@@ -1,7 +1,30 @@
 import json
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 
 import requests
+
+
+def _sanitize_json_text(raw: str) -> str:
+    """
+    Local LLMs sometimes emit smart quotes or odd unicode quotes that break JSON.
+    Convert common variants to standard ASCII quotes before json.loads().
+    """
+    if not isinstance(raw, str):
+        raw = str(raw)
+
+    replacements = {
+        "“": '"',
+        "”": '"',
+        "„": '"',
+        "‟": '"',
+        "’": "'",
+        "‘": "'",
+        "…": "...",
+    }
+    for k, v in replacements.items():
+        raw = raw.replace(k, v)
+
+    return raw
 
 
 def _forecast_change_pct(last_price: float, forecast_end: float) -> float:
@@ -47,34 +70,70 @@ def fallback_rank_from_evidence(evidence: Dict[str, Any]) -> List[str]:
     ranked = sorted(assets, key=score, reverse=True)
     return [a["symbol"] for a in ranked if "symbol" in a]
 
+
+# ----------------------------
+# v0.2 Ranker (decision only)
+# ----------------------------
+
+def _make_ranker_prompt(evidence: Dict[str, Any]) -> str:
+    symbols = [a["symbol"] for a in evidence.get("assets", [])]
+
+    example = {
+        "recommended_symbol": symbols[0] if symbols else "SPY",
+        "ranking": symbols,
+        "ranker_notes": [
+            "Top pick has the strongest forecast_change_pct in this dataset.",
+            "Second is more stable (lower volatility) but shows less upside signal here.",
+            "Third has worse drawdown/volatility tradeoffs in this window."
+        ]
+    }
+
+    return f"""
+You are an educational long-term investing assistant. You are NOT a financial advisor.
+Use ONLY the DATA below. Do NOT add external facts.
+
+Return ONLY valid JSON (no markdown, no extra text).
+Use only standard JSON double quotes " (ASCII). Do NOT use smart quotes like “ ” or „.
+All items in ranking and ranker_notes MUST be STRINGS.
+
+Allowed symbols:
+{json.dumps(symbols)}
+
+Required JSON schema:
+{{
+  "recommended_symbol": "one of allowed symbols",
+  "ranking": ["all allowed symbols exactly once, best to worst"],
+  "ranker_notes": ["2-4 SHORT string bullets that justify the ranking using ONLY: trend, volatility, max_drawdown, forecast_change_pct"]
+}}
+
+Example of correct format (follow structure only):
+{json.dumps(example, indent=2)}
+
+DATA:
+{json.dumps(evidence, indent=2)}
+""".strip()
+
+
 def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], evidence: Dict[str, Any]) -> Dict[str, Any]:
     rec = parsed.get("recommended_symbol")
     ranking = parsed.get("ranking", [])
 
-    # Basic validity checks
     valid = isinstance(ranking, list) and ranking and all(isinstance(s, str) for s in ranking)
     valid = valid and all(s in allowed_symbols for s in ranking)
     valid = valid and len(set(ranking)) == len(ranking)
-
-    # Must contain all expected symbols exactly once
     valid = valid and set(ranking) == set(allowed_symbols)
-
-    # rec must be valid and be the top-ranked symbol
     valid = valid and isinstance(rec, str) and rec in allowed_symbols and ranking and ranking[0] == rec
 
     used_fallback = False
-
     if not valid:
         used_fallback = True
         ranking = fallback_rank_from_evidence(evidence)
-        # Ensure fallback includes all symbols (defensive)
         ranking = [s for s in ranking if s in allowed_symbols]
         for s in allowed_symbols:
             if s not in ranking:
                 ranking.append(s)
         rec = ranking[0] if ranking else (allowed_symbols[0] if allowed_symbols else None)
 
-    # ranker_notes cleaning
     if used_fallback:
         notes = [
             "The model output was structurally invalid, so a deterministic fallback ranking was used.",
@@ -97,79 +156,178 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
         "ranker_notes": notes
     }
 
-def normalize_llm_output(parsed: Dict[str, Any], allowed_symbols: List[str], evidence: Dict[str, Any]) -> Dict[str, Any]:
-    rec = parsed.get("recommended_symbol")
-    ranking = parsed.get("ranking", [])
 
-    # If ranking isn't a proper list of allowed symbols, fall back to evidence ranking
-    if not isinstance(ranking, list) or not ranking or any(s not in allowed_symbols for s in ranking):
-        ranking = fallback_rank_from_evidence(evidence)
+def call_ollama_ranker_json(
+    evidence: Dict[str, Any],
+    model: str = "llama3.2:1b",
+    url: str = "http://localhost:11434/api/generate",
+    timeout_s: int = 60
+) -> Tuple[Dict[str, Any], str]:
+    prompt = _make_ranker_prompt(evidence)
+    allowed = [a["symbol"] for a in evidence.get("assets", [])]
 
-    # Ensure ranking contains all valid symbols exactly once
-    ranking = [s for s in ranking if s in allowed_symbols]
-    for s in allowed_symbols:
-        if s not in ranking:
-            ranking.append(s)
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "num_ctx": 1024,
+            "num_predict": 240
+        }
+    }
 
-    # If rec invalid, default to rank #1
-    if rec not in allowed_symbols:
-        rec = ranking[0] if ranking else (allowed_symbols[0] if allowed_symbols else None)
+    try:
+        r = requests.post(url, json=payload, timeout=timeout_s)
+        if r.status_code != 200:
+            fallback = {
+                "recommended_symbol": None,
+                "ranking": fallback_rank_from_evidence(evidence),
+                "ranker_notes": [f"(Ollama error {r.status_code})"]
+            }
+            return normalize_ranker_output(fallback, allowed, evidence), r.text
 
-    # Force rec to be ranked #1
-    if ranking and rec and ranking[0] != rec:
-        ranking = [rec] + [s for s in ranking if s != rec]
+        raw = r.json().get("response", "").strip()
+        raw_clean = _sanitize_json_text(raw)
 
-    parsed["recommended_symbol"] = rec
-    parsed["ranking"] = ranking
+    except Exception as e:
+        fallback = {
+            "recommended_symbol": None,
+            "ranking": fallback_rank_from_evidence(evidence),
+            "ranker_notes": ["(Request to Ollama failed.)"]
+        }
+        return normalize_ranker_output(fallback, allowed, evidence), str(e)
 
-    # Ensure bullets are strings (not dicts/objects), limit length
-    rb = parsed.get("reasoning_bullets", [])
-    if not isinstance(rb, list):
-        rb = []
-    parsed["reasoning_bullets"] = [str(x).strip() for x in rb if str(x).strip()][:5]
+    try:
+        parsed = json.loads(raw_clean)
+        return normalize_ranker_output(parsed, allowed, evidence), raw
+    except Exception:
+        pass
 
-    risks = parsed.get("risks", [])
-    if not isinstance(risks, list):
-        risks = []
-    parsed["risks"] = [str(x).strip() for x in risks if str(x).strip()][:4]
+    start = raw_clean.find("{")
+    end = raw_clean.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(raw_clean[start:end + 1])
+            return normalize_ranker_output(parsed, allowed, evidence), raw
+        except Exception:
+            pass
 
-    # De-duplicate risks vs reasoning
-    rb_set = set(parsed["reasoning_bullets"])
-    parsed["risks"] = [r for r in parsed["risks"] if r not in rb_set]
+    if raw_clean.strip().startswith("{") and not raw_clean.strip().endswith("}"):
+        try:
+            parsed = json.loads(raw_clean.strip() + "\n}")
+            return normalize_ranker_output(parsed, allowed, evidence), raw
+        except Exception:
+            pass
 
-    # Ensure at least 2 risks
-    if len(parsed["risks"]) < 2:
-        parsed["risks"] = [
-            "Forecasts are based on historical patterns and may fail if market regimes change.",
-            "High volatility can cause large drawdowns even if long-term trends appear positive."
-        ]
+    fallback = {
+        "recommended_symbol": None,
+        "ranking": fallback_rank_from_evidence(evidence),
+        "ranker_notes": ["(Model output could not be parsed as JSON.)"]
+    }
+    return normalize_ranker_output(fallback, allowed, evidence), raw
 
-    if "disclaimer" not in parsed or not isinstance(parsed["disclaimer"], str):
-        parsed["disclaimer"] = "Educational only, not financial advice."
 
-    return parsed
+# ----------------------------
+# v0.2 Explainer (explain only)
+# ----------------------------
+
+def _make_explainer_prompt(
+    evidence: Dict[str, Any],
+    final_ranking: List[str],
+    recommended_symbol: str,
+    ranker_notes: Optional[List[str]] = None,
+) -> str:
+    symbols = [a["symbol"] for a in evidence.get("assets", [])]
+    ranker_notes = ranker_notes or []
+
+    example = {
+        "headline": "Based on the evidence, SPY is the top long-term candidate in this set.",
+        "explanation": [
+            "SPY ranks first mainly because its forecast_change_pct is strongest in this dataset while volatility is relatively lower.",
+            "BTC-USD ranks second due to stronger upside signals but higher volatility and drawdown risk in this window.",
+            "ETH-USD ranks third given the tradeoffs shown in the evidence packet."
+        ],
+        "key_tradeoffs": [
+            "Upside signal (forecast_change_pct) vs stability (volatility).",
+            "Max drawdown highlights potential pain during market stress.",
+            "Trend labels depend on the chosen time window."
+        ],
+        "risks": [
+            "Forecasts are based on historical patterns and may fail in new market regimes.",
+            "High volatility can cause drawdowns that take years to recover from.",
+            "A limited historical window may overweight recent conditions."
+        ],
+        "disclaimer": "Educational only, not financial advice."
+    }
+
+    return f"""
+You are an educational long-term investing assistant. You are NOT a financial advisor.
+Use ONLY the DATA below. Do NOT add external facts.
+
+You MUST explain the FINAL ranking provided. You are NOT allowed to change the ranking.
+Do NOT output a new ranking. Do NOT recommend a different symbol.
+
+Return ONLY valid JSON (no markdown, no extra text).
+Use only standard JSON double quotes " (ASCII). Do NOT use smart quotes like “ ” or „.
+All list items MUST be STRINGS.
+
+Allowed symbols:
+{json.dumps(symbols)}
+
+FINAL RANKING (must be explained exactly):
+{json.dumps(final_ranking)}
+
+RECOMMENDED SYMBOL (must match rank #1):
+{json.dumps(recommended_symbol)}
+
+Optional ranker notes (may help keep consistency):
+{json.dumps(ranker_notes)}
+
+Required JSON schema:
+{{
+  "headline": "1 sentence",
+  "explanation": ["2-4 short bullets/paragraphs explaining WHY the final ranking makes sense using ONLY: trend, volatility, max_drawdown, forecast_change_pct"],
+  "key_tradeoffs": ["3 short bullets (comparisons/tradeoffs)"],
+  "risks": ["3-5 short bullets (general limitations, do NOT repeat explanation)"],
+  "disclaimer": "Educational only, not financial advice."
+}}
+
+Example of correct format (follow structure only):
+{json.dumps(example, indent=2)}
+
+DATA:
+{json.dumps(evidence, indent=2)}
+""".strip()
+
 
 def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    def _strip_wrapping_quotes(s: str) -> str:
+        s = s.strip()
+        if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+            s = s[1:-1].strip()
+        return s
+
     headline = parsed.get("headline", "")
     if not isinstance(headline, str):
         headline = str(headline)
+    headline = _strip_wrapping_quotes(headline)
 
     explanation = parsed.get("explanation", [])
     if not isinstance(explanation, list):
         explanation = []
-    explanation = [str(x).strip() for x in explanation if str(x).strip()][:4]
+    explanation = [_strip_wrapping_quotes(str(x).strip()) for x in explanation if str(x).strip()][:4]
 
     tradeoffs = parsed.get("key_tradeoffs", [])
     if not isinstance(tradeoffs, list):
         tradeoffs = []
-    tradeoffs = [str(x).strip() for x in tradeoffs if str(x).strip()][:3]
+    tradeoffs = [_strip_wrapping_quotes(str(x).strip()) for x in tradeoffs if str(x).strip()][:3]
 
     risks = parsed.get("risks", [])
     if not isinstance(risks, list):
         risks = []
-    risks = [str(x).strip() for x in risks if str(x).strip()][:5]
+    risks = [_strip_wrapping_quotes(str(x).strip()) for x in risks if str(x).strip()][:5]
 
-    # De-duplicate risks vs explanation/tradeoffs
     used = set(explanation) | set(tradeoffs)
     risks = [r for r in risks if r not in used]
 
@@ -195,42 +353,164 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
         "disclaimer": disclaimer.strip()
     }
 
-def _make_ranker_prompt(evidence: Dict[str, Any]) -> str:
-    symbols = [a["symbol"] for a in evidence.get("assets", [])]
 
-    example = {
-        "recommended_symbol": symbols[0] if symbols else "SPY",
-        "ranking": symbols,
-        "ranker_notes": [
-            "Top pick has the strongest forecast_change_pct in this dataset.",
-            "Second is more stable (lower volatility) but shows less upside signal here.",
-            "Third has worse drawdown/volatility tradeoffs in this window."
-        ]
+def call_ollama_explainer_json(
+    evidence: Dict[str, Any],
+    final_ranking: List[str],
+    recommended_symbol: str,
+    ranker_notes: Optional[List[str]] = None,
+    model: str = "llama3.2:1b",
+    url: str = "http://localhost:11434/api/generate",
+    timeout_s: int = 60
+) -> Tuple[Dict[str, Any], str]:
+    prompt = _make_explainer_prompt(evidence, final_ranking, recommended_symbol, ranker_notes=ranker_notes)
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.4,
+            "num_ctx": 1024,
+            "num_predict": 380
+        }
     }
 
-    return f"""
-You are an educational long-term investing assistant. You are NOT a financial advisor.
-Use ONLY the DATA below. Do NOT add external facts.
+    try:
+        r = requests.post(url, json=payload, timeout=timeout_s)
+        if r.status_code != 200:
+            fallback = normalize_explainer_output({
+                "headline": f"(Ollama error {r.status_code})",
+                "explanation": ["Could not generate explanation from local model."],
+                "key_tradeoffs": [],
+                "risks": ["Local model call failed; try rerunning or changing the model."],
+                "disclaimer": "Educational only, not financial advice."
+            })
+            return fallback, r.text
 
-Return ONLY valid JSON (no markdown, no extra text).
-All items in ranking and ranker_notes MUST be STRINGS.
+        raw = r.json().get("response", "").strip()
+        raw_clean = _sanitize_json_text(raw)
 
-Allowed symbols:
-{json.dumps(symbols)}
+    except Exception as e:
+        fallback = normalize_explainer_output({
+            "headline": "(Request to Ollama failed.)",
+            "explanation": ["Could not generate explanation due to an error."],
+            "key_tradeoffs": [],
+            "risks": [str(e)],
+            "disclaimer": "Educational only, not financial advice."
+        })
+        return fallback, str(e)
 
-Required JSON schema:
-{{
-  "recommended_symbol": "one of allowed symbols",
-  "ranking": ["all allowed symbols exactly once, best to worst"],
-  "ranker_notes": ["2-4 SHORT string bullets that justify the ranking using ONLY: trend, volatility, max_drawdown, forecast_change_pct"]
-}}
+    try:
+        parsed = json.loads(raw_clean)
+        return normalize_explainer_output(parsed), raw
+    except Exception:
+        pass
 
-Example of correct format (follow structure only):
-{json.dumps(example, indent=2)}
+    start = raw_clean.find("{")
+    end = raw_clean.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(raw_clean[start:end + 1])
+            return normalize_explainer_output(parsed), raw
+        except Exception:
+            pass
 
-DATA:
-{json.dumps(evidence, indent=2)}
-""".strip()
+    if raw_clean.strip().startswith("{") and not raw_clean.strip().endswith("}"):
+        try:
+            parsed = json.loads(raw_clean.strip() + "\n}")
+            return normalize_explainer_output(parsed), raw
+        except Exception:
+            pass
+
+    fallback = normalize_explainer_output({
+        "headline": "(Model output could not be parsed as JSON.)",
+        "explanation": ["LLM output parsing failed; try rerunning or changing the model."],
+        "key_tradeoffs": [],
+        "risks": [],
+        "disclaimer": "Educational only, not financial advice."
+    })
+    return fallback, raw
+
+
+# ----------------------------
+# Public v0.2 wrappers
+# ----------------------------
+
+def run_ranker_llm(
+    evidence: Dict[str, Any],
+    model: str = "llama3.2:1b",
+) -> Tuple[Dict[str, Any], str]:
+    return call_ollama_ranker_json(evidence, model=model)
+
+
+def run_explainer_llm(
+    final_ranking: List[str],
+    evidence: Dict[str, Any],
+    model: str = "llama3.2:1b",
+    recommended_symbol: Optional[str] = None,
+    ranker_notes: Optional[List[str]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    if recommended_symbol is None:
+        recommended_symbol = final_ranking[0] if final_ranking else ""
+    return call_ollama_explainer_json(
+        evidence=evidence,
+        final_ranking=final_ranking,
+        recommended_symbol=recommended_symbol,
+        ranker_notes=ranker_notes,
+        model=model
+    )
+
+
+# ----------------------------
+# Legacy v0.1 one-shot call (kept temporarily)
+# ----------------------------
+
+def normalize_llm_output(parsed: Dict[str, Any], allowed_symbols: List[str], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    rec = parsed.get("recommended_symbol")
+    ranking = parsed.get("ranking", [])
+
+    if not isinstance(ranking, list) or not ranking or any(s not in allowed_symbols for s in ranking):
+        ranking = fallback_rank_from_evidence(evidence)
+
+    ranking = [s for s in ranking if s in allowed_symbols]
+    for s in allowed_symbols:
+        if s not in ranking:
+            ranking.append(s)
+
+    if rec not in allowed_symbols:
+        rec = ranking[0] if ranking else (allowed_symbols[0] if allowed_symbols else None)
+
+    if ranking and rec and ranking[0] != rec:
+        ranking = [rec] + [s for s in ranking if s != rec]
+
+    parsed["recommended_symbol"] = rec
+    parsed["ranking"] = ranking
+
+    rb = parsed.get("reasoning_bullets", [])
+    if not isinstance(rb, list):
+        rb = []
+    parsed["reasoning_bullets"] = [str(x).strip() for x in rb if str(x).strip()][:5]
+
+    risks = parsed.get("risks", [])
+    if not isinstance(risks, list):
+        risks = []
+    parsed["risks"] = [str(x).strip() for x in risks if str(x).strip()][:4]
+
+    rb_set = set(parsed["reasoning_bullets"])
+    parsed["risks"] = [r for r in parsed["risks"] if r not in rb_set]
+
+    if len(parsed["risks"]) < 2:
+        parsed["risks"] = [
+            "Forecasts are based on historical patterns and may fail if market regimes change.",
+            "High volatility can cause large drawdowns even if long-term trends appear positive."
+        ]
+
+    if "disclaimer" not in parsed or not isinstance(parsed["disclaimer"], str):
+        parsed["disclaimer"] = "Educational only, not financial advice."
+
+    return parsed
+
 
 def _make_prompt(evidence: Dict[str, Any]) -> str:
     symbols = [a["symbol"] for a in evidence["assets"]]
@@ -275,240 +555,6 @@ DATA:
 {json.dumps(evidence, indent=2)}
 """.strip()
 
-def _make_explainer_prompt(
-    evidence: Dict[str, Any],
-    final_ranking: List[str],
-    recommended_symbol: str,
-    ranker_notes: List[str] | None = None,
-) -> str:
-    symbols = [a["symbol"] for a in evidence.get("assets", [])]
-    ranker_notes = ranker_notes or []
-
-    example = {
-        "headline": "Based on the evidence, SPY is the top long-term candidate in this set.",
-        "explanation": [
-            "SPY ranks first mainly because its forecast_change_pct is strongest in this dataset while volatility is relatively lower.",
-            "BTC-USD ranks second due to stronger upside signals but higher volatility and drawdown risk in this window.",
-            "ETH-USD ranks third given the tradeoffs shown in the evidence packet."
-        ],
-        "key_tradeoffs": [
-            "Upside signal (forecast_change_pct) vs stability (volatility).",
-            "Max drawdown highlights potential pain during market stress.",
-            "Trend labels depend on the chosen time window."
-        ],
-        "risks": [
-            "Forecasts are based on historical patterns and may fail in new market regimes.",
-            "High volatility can cause drawdowns that take years to recover from.",
-            "A limited historical window may overweight recent conditions."
-        ],
-        "disclaimer": "Educational only, not financial advice."
-    }
-
-    return f"""
-You are an educational long-term investing assistant. You are NOT a financial advisor.
-Use ONLY the DATA below. Do NOT add external facts.
-
-You MUST explain the FINAL ranking provided. You are NOT allowed to change the ranking.
-Do NOT output a new ranking. Do NOT recommend a different symbol.
-
-Return ONLY valid JSON (no markdown, no extra text).
-All list items MUST be STRINGS.
-
-Allowed symbols:
-{json.dumps(symbols)}
-
-FINAL RANKING (must be explained exactly):
-{json.dumps(final_ranking)}
-
-RECOMMENDED SYMBOL (must match rank #1):
-{json.dumps(recommended_symbol)}
-
-Optional ranker notes (may help keep consistency):
-{json.dumps(ranker_notes)}
-
-Required JSON schema:
-{{
-  "headline": "1 sentence",
-  "explanation": ["2-4 short paragraphs or bullets explaining WHY the final ranking makes sense using ONLY: trend, volatility, max_drawdown, forecast_change_pct"],
-  "key_tradeoffs": ["3 short bullets (comparisons/tradeoffs)"],
-  "risks": ["3-5 short bullets (general limitations, do NOT repeat explanation)"],
-  "disclaimer": "Educational only, not financial advice."
-}}
-
-Example of correct format (follow structure only):
-{json.dumps(example, indent=2)}
-
-DATA:
-{json.dumps(evidence, indent=2)}
-""".strip()
-
-def run_ranker_llm(evidence: Dict[str, Any], model: str = "llama3.2:1b") -> Tuple[Dict[str, Any], str]:
-    return call_ollama_ranker_json(evidence, model=model)
-
-def run_explainer_llm(
-    final_ranking: List[str],
-    evidence: Dict[str, Any],
-    model: str = "llama3.2:1b",
-    recommended_symbol: str | None = None,
-    ranker_notes: List[str] | None = None,
-) -> Tuple[Dict[str, Any], str]:
-    if recommended_symbol is None:
-        recommended_symbol = final_ranking[0] if final_ranking else ""
-    return call_ollama_explainer_json(
-        evidence=evidence,
-        final_ranking=final_ranking,
-        recommended_symbol=recommended_symbol,
-        ranker_notes=ranker_notes,
-        model=model
-    )
-
-def call_ollama_ranker_json(
-    evidence: Dict[str, Any],
-    model: str = "llama3.2:1b",
-    url: str = "http://localhost:11434/api/generate",
-    timeout_s: int = 60
-) -> Tuple[Dict[str, Any], str]:
-    prompt = _make_ranker_prompt(evidence)
-    allowed = [a["symbol"] for a in evidence.get("assets", [])]
-
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.2,
-            "num_ctx": 1024,
-            "num_predict": 240
-        }
-    }
-
-    try:
-        r = requests.post(url, json=payload, timeout=timeout_s)
-        if r.status_code != 200:
-            fallback = {
-                "recommended_symbol": None,
-                "ranking": fallback_rank_from_evidence(evidence),
-                "ranker_notes": [f"(Ollama error {r.status_code})"]
-            }
-            return normalize_ranker_output(fallback, allowed, evidence), r.text
-
-        raw = r.json().get("response", "").strip()
-
-    except Exception as e:
-        fallback = {
-            "recommended_symbol": None,
-            "ranking": fallback_rank_from_evidence(evidence),
-            "ranker_notes": ["(Request to Ollama failed.)"]
-        }
-        return normalize_ranker_output(fallback, allowed, evidence), str(e)
-
-    # Parse JSON (same strategy as call_ollama_json)
-    try:
-        parsed = json.loads(raw)
-        return normalize_ranker_output(parsed, allowed, evidence), raw
-    except Exception:
-        pass
-
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(raw[start:end + 1])
-            return normalize_ranker_output(parsed, allowed, evidence), raw
-        except Exception:
-            pass
-
-    if raw.strip().startswith("{") and not raw.strip().endswith("}"):
-        try:
-            parsed = json.loads(raw.strip() + "\n}")
-            return normalize_ranker_output(parsed, allowed, evidence), raw
-        except Exception:
-            pass
-
-    fallback = {
-        "recommended_symbol": None,
-        "ranking": fallback_rank_from_evidence(evidence),
-        "ranker_notes": ["(Model output could not be parsed as JSON.)"]
-    }
-    return normalize_ranker_output(fallback, allowed, evidence), raw
-
-def call_ollama_explainer_json(
-    evidence: Dict[str, Any],
-    final_ranking: List[str],
-    recommended_symbol: str,
-    ranker_notes: List[str] | None = None,
-    model: str = "llama3.2:1b",
-    url: str = "http://localhost:11434/api/generate",
-    timeout_s: int = 60
-) -> Tuple[Dict[str, Any], str]:
-    prompt = _make_explainer_prompt(evidence, final_ranking, recommended_symbol, ranker_notes=ranker_notes)
-
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.4,
-            "num_ctx": 1024,
-            "num_predict": 380
-        }
-    }
-
-    try:
-        r = requests.post(url, json=payload, timeout=timeout_s)
-        if r.status_code != 200:
-            fallback = normalize_explainer_output({
-                "headline": f"(Ollama error {r.status_code})",
-                "explanation": ["Could not generate explanation from local model."],
-                "key_tradeoffs": [],
-                "risks": ["Local model call failed; try rerunning or changing the model."],
-                "disclaimer": "Educational only, not financial advice."
-            })
-            return fallback, r.text
-
-        raw = r.json().get("response", "").strip()
-
-    except Exception as e:
-        fallback = normalize_explainer_output({
-            "headline": "(Request to Ollama failed.)",
-            "explanation": ["Could not generate explanation due to an error."],
-            "key_tradeoffs": [],
-            "risks": [str(e)],
-            "disclaimer": "Educational only, not financial advice."
-        })
-        return fallback, str(e)
-
-    # Parse JSON (same strategy)
-    try:
-        parsed = json.loads(raw)
-        return normalize_explainer_output(parsed), raw
-    except Exception:
-        pass
-
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(raw[start:end + 1])
-            return normalize_explainer_output(parsed), raw
-        except Exception:
-            pass
-
-    if raw.strip().startswith("{") and not raw.strip().endswith("}"):
-        try:
-            parsed = json.loads(raw.strip() + "\n}")
-            return normalize_explainer_output(parsed), raw
-        except Exception:
-            pass
-
-    fallback = normalize_explainer_output({
-        "headline": "(Model output could not be parsed as JSON.)",
-        "explanation": ["LLM output parsing failed; try rerunning or changing the model."],
-        "key_tradeoffs": [],
-        "risks": [],
-        "disclaimer": "Educational only, not financial advice."
-    })
-    return fallback, raw
 
 def call_ollama_json(
     evidence: Dict[str, Any],
@@ -516,10 +562,6 @@ def call_ollama_json(
     url: str = "http://localhost:11434/api/generate",
     timeout_s: int = 60
 ) -> Tuple[Dict[str, Any], str]:
-    """
-    Call Ollama and return (parsed_json, raw_text). If parsing fails or Ollama errors,
-    returns a safe fallback object and the raw response text.
-    """
     prompt = _make_prompt(evidence)
     allowed = [a["symbol"] for a in evidence.get("assets", [])]
 
@@ -536,7 +578,6 @@ def call_ollama_json(
 
     try:
         r = requests.post(url, json=payload, timeout=timeout_s)
-
         if r.status_code != 200:
             fallback = {
                 "recommended_symbol": None,
@@ -548,6 +589,7 @@ def call_ollama_json(
             return fallback, r.text
 
         raw = r.json().get("response", "").strip()
+        raw_clean = _sanitize_json_text(raw)
 
     except Exception as e:
         fallback = {
@@ -559,29 +601,26 @@ def call_ollama_json(
         }
         return fallback, str(e)
 
-    # Try strict JSON parse
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(raw_clean)
         parsed = normalize_llm_output(parsed, allowed, evidence)
         return parsed, raw
     except Exception:
         pass
 
-    # Fallback: try to extract JSON object
-    start = raw.find("{")
-    end = raw.rfind("}")
+    start = raw_clean.find("{")
+    end = raw_clean.rfind("}")
     if start != -1 and end != -1 and end > start:
         try:
-            parsed = json.loads(raw[start:end + 1])
+            parsed = json.loads(raw_clean[start:end + 1])
             parsed = normalize_llm_output(parsed, allowed, evidence)
             return parsed, raw
         except Exception:
             pass
 
-    # Last-resort: close likely-truncated JSON
-    if raw.strip().startswith("{") and not raw.strip().endswith("}"):
+    if raw_clean.strip().startswith("{") and not raw_clean.strip().endswith("}"):
         try:
-            parsed = json.loads(raw.strip() + "\n}")
+            parsed = json.loads(raw_clean.strip() + "\n}")
             parsed = normalize_llm_output(parsed, allowed, evidence)
             return parsed, raw
         except Exception:
