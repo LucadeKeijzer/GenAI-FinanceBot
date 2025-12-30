@@ -36,6 +36,8 @@ def _read_wallet_csv(path: Path) -> Wallet:
 
     return Wallet(positions=positions, source="csv")
 
+def wallet_symbols(wallet: Wallet) -> list[str]:
+    return [p["symbol"] for p in wallet.positions if p.get("quantity", 0) > 0]
 
 def load_wallet(api_url: str = DEFAULT_WALLET_API_URL, csv_path: Path = DEFAULT_WALLET_CSV_PATH) -> Wallet:
     # 1) Try API

@@ -9,7 +9,7 @@ DEFAULT_SETTINGS_PATH = Path("user_settings.json")
 @dataclass
 class UserSettings:
     experience_level: str = "Beginner"   # Beginner / Intermediate / Advanced
-    budget_range: str = "€100–1000"      # €0–100 / €100–1000 / €1000+
+    budget_range: str = "€100-1000"      # €0–100 / €100–1000 / €1000+
     detail_level: str = "Simple"         # Simple / Advanced
     language: str = "English"            # English (Dutch later)
 

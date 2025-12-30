@@ -6,7 +6,7 @@ from src.llm import build_evidence_packet, run_ranker_llm, run_explainer_llm
 from src.settings import load_user_settings, save_user_settings, UserSettings
 from src.wallet import load_wallet  # v0.3 Step 2
 
-WATCHLIST = ["BTC-USD", "ETH-USD", "SPY"]
+STARTER_LIST = ["BTC-USD", "ETH-USD", "SOL-USD", "SPY"]
 PERIOD = "4y"
 FORECAST_DAYS = 90
 OLLAMA_MODEL = "llama3.2:1b"
@@ -122,6 +122,12 @@ def main():
     # MUST happen before we render sidebar that references wallet
     # -----------------------------
     wallet = load_wallet()
+    wallet_syms = [p["symbol"] for p in wallet.positions if p.get("quantity", 0) > 0]
+
+    candidates = []
+    for s in wallet_syms + STARTER_LIST:
+        if s not in candidates:
+            candidates.append(s)
 
     # -----------------------------
     # Sidebar (read-only settings + wallet display)
@@ -147,7 +153,7 @@ def main():
     # v0.2 pipeline continues unchanged below this line
     # -----------------------------
     with st.spinner("Analyzing assets..."):
-        results = compute_all_assets(WATCHLIST, PERIOD, FORECAST_DAYS)
+        results = compute_all_assets(candidates, PERIOD, FORECAST_DAYS)
 
     evidence = build_evidence_packet(results)
 
