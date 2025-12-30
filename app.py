@@ -169,8 +169,14 @@ def main():
         }
     )
 
+    # Ranker should NOT be influenced by detail_level (that's communication-only).
+    ranker_evidence = dict(evidence)
+    ranker_user_settings = dict(ranker_evidence.get("user_settings", {}))
+    ranker_user_settings.pop("detail_level", None)
+    ranker_evidence["user_settings"] = ranker_user_settings
+
     with st.spinner("Generating GenAI ranking (Ranker)..."):
-        ranker_output, raw_ranker = run_ranker_llm(evidence, model=OLLAMA_MODEL)
+        ranker_output, raw_ranker = run_ranker_llm(ranker_evidence, model=OLLAMA_MODEL)
 
     final_ranking = ranker_output.get("ranking", [])
     recommended_symbol = ranker_output.get("recommended_symbol", "")
@@ -205,6 +211,7 @@ def main():
         st.warning("No ranking returned.")
 
     st.subheader("🧠 Explanation")
+    st.caption(f"Explanation detail level: {settings.detail_level}")
     headline = explainer_output.get("headline", "")
     explanation = explainer_output.get("explanation", [])
     risks = explainer_output.get("risks", [])
@@ -241,8 +248,8 @@ def main():
             st.json(results[sym].metrics)
 
     # ---- Debug ----
-    with st.expander("🔍 Raw Ranker output (debug)"):
-        st.text(raw_ranker)
+    with st.expander("🔍 Evidence packet (debug)"):
+        st.json(evidence)
 
     with st.expander("🔍 Raw Explainer output (debug)"):
         st.text(raw_explainer)

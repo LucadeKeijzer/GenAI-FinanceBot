@@ -282,9 +282,9 @@ def call_ollama_ranker_json(
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.2,
+            "temperature": 0.0,
             "num_ctx": 1024,
-            "num_predict": 240
+            "num_predict": 300
         }
     }
 
@@ -352,33 +352,74 @@ def _make_explainer_prompt(
     symbols = [a["symbol"] for a in evidence.get("assets", [])]
     ranker_notes = ranker_notes or []
 
+    user_settings = evidence.get("user_settings", {}) or {}
+    detail_level = str(user_settings.get("detail_level", "Simple")).strip() or "Simple"
+
+    # Build an example that ALWAYS aligns with the recommended symbol
+    ex_top = recommended_symbol if recommended_symbol in symbols else (symbols[0] if symbols else "ASSET")
+    ex_second = None
+    for s in final_ranking:
+        if s != ex_top:
+            ex_second = s
+            break
+    ex_third = None
+    for s in final_ranking:
+        if s not in {ex_top, ex_second}:
+            ex_third = s
+            break
+
     example = {
-        "headline": "Based on the evidence, SPY is the top long-term candidate in this set.",
+        "headline": f"Based on the evidence, {ex_top} is the strongest long-term candidate in this comparison.",
         "explanation": [
-            "SPY ranks first mainly because its forecast_change_pct is strongest in this dataset while volatility is relatively lower.",
-            "BTC-USD ranks second due to stronger upside signals but higher volatility and drawdown risk in this window.",
-            "ETH-USD ranks third given the tradeoffs shown in the evidence packet."
+            f"{ex_top} ranks first because it shows the most favorable overall balance in the evidence for this time window.",
+            f"{ex_second or 'The second-ranked asset'} follows with different upside vs risk tradeoffs.",
+            f"{ex_third or 'The third-ranked asset'} ranks lower due to less favorable signals in the evidence."
         ],
         "key_tradeoffs": [
-            "Upside signal (forecast_change_pct) vs stability (volatility).",
-            "Max drawdown highlights potential pain during market stress.",
-            "Trend labels depend on the chosen time window."
+            "Upside signal (forecast_change_pct) versus stability (volatility).",
+            "Max drawdown reflects potential downside during market stress.",
+            "Trends depend on the selected historical window."
         ],
         "risks": [
-            "Forecasts are based on historical patterns and may fail in new market regimes.",
-            "High volatility can cause drawdowns that take years to recover from.",
-            "A limited historical window may overweight recent conditions."
+            "Forecasts are based on historical data and may not predict future market behavior.",
+            "High volatility can lead to large drawdowns even for strong assets.",
+            "Results depend on the chosen time period and metrics."
         ],
         "disclaimer": "Educational only, not financial advice."
     }
 
     return f"""
+DATA:
+{json.dumps(evidence, indent=2)}
+
 You are an educational long-term investing assistant. You are NOT a financial advisor.
 Use ONLY the DATA below. Do NOT add external facts.
 
-You MUST explain the FINAL ranking provided. You are NOT allowed to change the ranking.
-Do NOT output a new ranking. Do NOT recommend a different symbol.
+CRITICAL RULES:
+- The Ranker has already made the FINAL decision.
+- You MUST explain the provided final ranking.
+- You MUST treat "{recommended_symbol}" as the final top pick.
+- You MUST NOT introduce a different top pick or re-rank assets.
+- You MAY mention other assets only for comparison.
 
+User detail level:
+{detail_level}
+
+Detail level instructions:
+- If detail level is "Simple":
+  - Use plain language.
+  - Avoid unexplained jargon.
+  - Avoid raw metric values unless absolutely necessary.
+- If detail level is "Advanced":
+  - You SHOULD reference key signals from the evidence when they materially support the decision.
+  - When using numbers:
+    - Do NOT mention internal metric names (e.g. do not say "forecast_change_pct").
+    - Translate signals into natural language (e.g. "around 3% upside", "roughly 80% potential increase", "a small expected decline").
+    - If the recommended asset ranks first due to a clearly stronger forecast signal or much lower volatility than others, you MUST include one approximate percentage to justify this.
+    - Use rounded, human-friendly percentages when helpful.
+  - Include at most 1-2 numeric references total.
+
+Do NOT repeat the DATA. Do NOT output the evidence JSON. Only output the required JSON schema.
 Return ONLY valid JSON (no markdown, no extra text).
 Use only standard JSON double quotes " (ASCII). Do NOT use smart quotes like “ ” or „.
 All list items MUST be STRINGS.
@@ -397,20 +438,16 @@ Optional ranker notes (may help keep consistency):
 
 Required JSON schema:
 {{
-  "headline": "1 sentence",
-  "explanation": ["2-4 short bullets/paragraphs explaining WHY the final ranking makes sense using ONLY: trend, volatility, max_drawdown, forecast_change_pct"],
-  "key_tradeoffs": ["3 short bullets (comparisons/tradeoffs)"],
-  "risks": ["3-5 short bullets (general limitations, do NOT repeat explanation)"],
+  "headline": "1 sentence summary that MUST name the recommended symbol",
+  "explanation": ["2-4 short bullets that MUST reference the evidence. Each bullet must mention at least TWO of: forecast direction (positive/negative), volatility (higher/lower vs others), max_drawdown (larger/smaller vs others), trend (bullish/bearish). In Simple mode do NOT use numbers; in Advanced mode you may include at most 1-2 metric values total."],
+  "key_tradeoffs": ["2-4 short bullets describing tradeoffs vs other assets"],
+  "risks": ["1-3 short bullets describing general limitations"],
   "disclaimer": "Educational only, not financial advice."
 }}
 
 Example of correct format (follow structure only):
 {json.dumps(example, indent=2)}
-
-DATA:
-{json.dumps(evidence, indent=2)}
 """.strip()
-
 
 def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
     def _strip_wrapping_quotes(s: str) -> str:
@@ -481,9 +518,9 @@ def call_ollama_explainer_json(
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.4,
+            "temperature": 0.0,
             "num_ctx": 1024,
-            "num_predict": 380
+            "num_predict": 700
         }
     }
 
@@ -535,7 +572,7 @@ def call_ollama_explainer_json(
             pass
 
     fallback = normalize_explainer_output({
-        "headline": "(Model output could not be parsed as JSON.)",
+        "headline": "[Fallback] Explanation could not be generated reliably",
         "explanation": ["LLM output parsing failed; try rerunning or changing the model."],
         "key_tradeoffs": [],
         "risks": [],
@@ -671,7 +708,10 @@ def call_ollama_json(
     evidence: Dict[str, Any],
     model: str = "llama3.2:1b",
     url: str = "http://localhost:11434/api/generate",
-    timeout_s: int = 60
+    timeout_s: int = 60,
+    temperature: float = 0.2,
+    num_predict: int = 300,
+    num_ctx: int = 1024,
 ) -> Tuple[Dict[str, Any], str]:
     prompt = _make_prompt(evidence)
     allowed = [a["symbol"] for a in evidence.get("assets", [])]
@@ -681,9 +721,9 @@ def call_ollama_json(
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.2,
-            "num_ctx": 1024,
-            "num_predict": 300
+            "temperature": temperature,
+            "num_ctx": num_ctx,
+            "num_predict": num_predict
         }
     }
 
