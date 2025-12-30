@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from src.pipeline import run_asset_pipeline
 from src.llm import build_evidence_packet, run_ranker_llm, run_explainer_llm
 from src.settings import load_user_settings, save_user_settings, UserSettings
+from src.wallet import load_wallet  # v0.3 Step 2
 
 WATCHLIST = ["BTC-USD", "ETH-USD", "SPY"]
 PERIOD = "4y"
@@ -116,7 +117,15 @@ def main():
     if settings is None:
         render_first_run_setup()
 
-    # Read-only display for now (editable panel comes later in v0.3)
+    # -----------------------------
+    # v0.3 Step 2: Load Wallet (API -> CSV fallback)
+    # MUST happen before we render sidebar that references wallet
+    # -----------------------------
+    wallet = load_wallet()
+
+    # -----------------------------
+    # Sidebar (read-only settings + wallet display)
+    # -----------------------------
     with st.sidebar:
         st.subheader("⚙️ User Settings")
         st.write(f"Experience: **{settings.experience_level}**")
@@ -124,13 +133,22 @@ def main():
         st.write(f"Detail: **{settings.detail_level}**")
         st.write(f"Language: **{settings.language}**")
 
+        st.divider()
+
+        st.subheader("👛 Wallet")
+        st.caption(f"Source: {wallet.source}")
+        if wallet.positions:
+            for p in wallet.positions:
+                st.write(f"- {p['symbol']}: {p['quantity']}")
+        else:
+            st.write("No holdings found.")
+
     # -----------------------------
     # v0.2 pipeline continues unchanged below this line
     # -----------------------------
     with st.spinner("Analyzing assets..."):
         results = compute_all_assets(WATCHLIST, PERIOD, FORECAST_DAYS)
 
-    # Build evidence once (used by both ranker and explainer)
     evidence = build_evidence_packet(results)
 
     with st.spinner("Generating GenAI ranking (Ranker)..."):

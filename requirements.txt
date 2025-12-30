@@ -1,4 +1,6 @@
 statsmodels
 streamlit
 matplotlib
+fastapi
+uvicorn
 requests
