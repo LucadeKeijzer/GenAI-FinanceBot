@@ -144,6 +144,26 @@ DATA:
 {json.dumps(evidence, indent=2)}
 """.strip()
 
+def run_ranker_llm(
+    evidence: Dict[str, Any],
+    model: str = "llama3.2:1b",
+) -> Tuple[Dict[str, Any], str]:
+    """
+    GenAI Ranker — decides ranking + recommended_symbol.
+    (v0.2: explanation still included temporarily)
+    """
+    return call_ollama_json(evidence, model=model)
+
+def run_explainer_llm(
+    final_ranking: List[str],
+    evidence: Dict[str, Any],
+    model: str = "llama3.2:1b",
+) -> Tuple[Dict[str, Any], str]:
+    """
+    GenAI Explainer — explains a given ranking.
+    (v0.2 placeholder: reuses existing LLM behavior for now)
+    """
+    return call_ollama_json(evidence, model=model)
 
 def call_ollama_json(
     evidence: Dict[str, Any],
