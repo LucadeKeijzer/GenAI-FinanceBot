@@ -70,7 +70,7 @@ def render_first_run_setup() -> None:
 
         budget_range = st.selectbox(
             "Budget range",
-            ["€0–100", "€100–1000", "€1000+"],
+            ["€0-100", "€100-1000", "€1000+"],
             index=1,
             help=budget_help,
         )
@@ -175,6 +175,8 @@ def main():
     final_ranking = ranker_output.get("ranking", [])
     recommended_symbol = ranker_output.get("recommended_symbol", "")
     ranker_notes = ranker_output.get("ranker_notes", [])
+    actions = ranker_output.get("actions", {})
+    confidence = ranker_output.get("confidence", "medium")
 
     with st.spinner("Generating explanation (Explainer)..."):
         explainer_output, raw_explainer = run_explainer_llm(
@@ -188,13 +190,17 @@ def main():
     # ---- UI ----
     st.subheader("✅ Recommendation")
     if recommended_symbol:
+        rec_action = actions.get(recommended_symbol, "consider")
         st.markdown(f"**Recommended asset:** `{recommended_symbol}`")
+        st.markdown(f"**Suggested action:** `{rec_action}`  |  **Confidence:** `{confidence}`")
     else:
         st.warning("No recommendation returned.")
 
     st.subheader("📊 Ranking")
     if final_ranking:
-        st.write(final_ranking)
+        for sym in final_ranking:
+            act = actions.get(sym, "consider")
+            st.write(f"- {sym} → **{act}**")
     else:
         st.warning("No ranking returned.")
 

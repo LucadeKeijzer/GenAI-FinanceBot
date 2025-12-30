@@ -90,9 +90,29 @@ def fallback_rank_from_evidence(evidence: Dict[str, Any]) -> List[str]:
 def _make_ranker_prompt(evidence: Dict[str, Any]) -> str:
     symbols = [a["symbol"] for a in evidence.get("assets", [])]
 
+    wallet_positions = (evidence.get("wallet") or {}).get("positions", [])
+    held_symbols = []
+    for p in wallet_positions:
+        try:
+            sym = str(p.get("symbol", "")).strip()
+            qty = float(p.get("quantity", 0))
+        except Exception:
+            continue
+        if sym and qty > 0:
+            held_symbols.append(sym)
+
+    allowed_actions = ["consider", "add", "hold", "reduce", "sell", "avoid"]
+
+    example_actions = {s: ("hold" if s in held_symbols else "consider") for s in symbols}
+    if symbols:
+        # Example: top pick usually "add" (or "hold" if already held)
+        example_actions[symbols[0]] = "hold" if symbols[0] in held_symbols else "add"
+
     example = {
         "recommended_symbol": symbols[0] if symbols else "SPY",
         "ranking": symbols,
+        "actions": example_actions,
+        "confidence": "medium",
         "ranker_notes": [
             "Top pick has the strongest forecast_change_pct in this dataset.",
             "Second is more stable (lower volatility) but shows less upside signal here.",
@@ -111,11 +131,23 @@ All items in ranking and ranker_notes MUST be STRINGS.
 Allowed symbols:
 {json.dumps(symbols)}
 
+Allowed actions:
+{json.dumps(allowed_actions)}
+
+Wallet held symbols (quantity > 0):
+{json.dumps(held_symbols)}
+
+Action rule:
+- "sell" and "reduce" are ONLY allowed for symbols that are held in the wallet.
+- For symbols not held, use: consider / add / hold / avoid (NOT sell/reduce).
+
 Required JSON schema:
 {{
   "recommended_symbol": "one of allowed symbols",
   "ranking": ["all allowed symbols exactly once, best to worst"],
-  "ranker_notes": ["2-4 SHORT string bullets that justify the ranking using ONLY: trend, volatility, max_drawdown, forecast_change_pct"]
+  "actions": {{"SYMBOL": "one allowed action" (must include ALL symbols)}},
+  "confidence": "low|medium|high",
+  "ranker_notes": ["2-4 SHORT string bullets that justify ranking/actions using ONLY: trend, volatility, max_drawdown, forecast_change_pct, plus wallet context"]
 }}
 
 Example of correct format (follow structure only):
@@ -125,11 +157,11 @@ DATA:
 {json.dumps(evidence, indent=2)}
 """.strip()
 
-
 def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], evidence: Dict[str, Any]) -> Dict[str, Any]:
     rec = parsed.get("recommended_symbol")
     ranking = parsed.get("ranking", [])
 
+    # --- validate ranking (existing v0.2 logic) ---
     valid = isinstance(ranking, list) and ranking and all(isinstance(s, str) for s in ranking)
     valid = valid and all(s in allowed_symbols for s in ranking)
     valid = valid and len(set(ranking)) == len(ranking)
@@ -146,10 +178,55 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
                 ranking.append(s)
         rec = ranking[0] if ranking else (allowed_symbols[0] if allowed_symbols else None)
 
+    # --- wallet held symbols (for action guardrail) ---
+    wallet_positions = (evidence.get("wallet") or {}).get("positions", [])
+    held = set()
+    for p in wallet_positions:
+        try:
+            sym = str(p.get("symbol", "")).strip()
+            qty = float(p.get("quantity", 0))
+        except Exception:
+            continue
+        if sym and qty > 0:
+            held.add(sym)
+
+    allowed_actions = {"consider", "add", "hold", "reduce", "sell", "avoid"}
+
+    # --- actions normalization (new in v0.3 Step 5) ---
+    actions_in = parsed.get("actions", {})
+    actions: Dict[str, str] = {}
+
+    if isinstance(actions_in, dict):
+        for sym in allowed_symbols:
+            act = actions_in.get(sym)
+            if isinstance(act, str):
+                act = act.strip().lower()
+                actions[sym] = act
+
+    # fill defaults for missing/invalid actions
+    for sym in allowed_symbols:
+        if sym not in actions or actions[sym] not in allowed_actions:
+            actions[sym] = "hold" if sym in held else "consider"
+
+    # hard guardrail: sell/reduce only if held
+    for sym in allowed_symbols:
+        if actions[sym] in {"sell", "reduce"} and sym not in held:
+            actions[sym] = "avoid"
+
+    # --- confidence normalization ---
+    conf = parsed.get("confidence", "medium")
+    if not isinstance(conf, str):
+        conf = "medium"
+    conf = conf.strip().lower()
+    if conf not in {"low", "medium", "high"}:
+        conf = "medium"
+
+    # --- notes normalization (existing) ---
     if used_fallback:
         notes = [
             "The model output was structurally invalid, so a deterministic fallback ranking was used.",
-            "Fallback ranking is based on forecast_change_pct, volatility, and max_drawdown from the evidence."
+            "Fallback ranking is based on forecast_change_pct, volatility, and max_drawdown from the evidence.",
+            "Actions were normalized using wallet holdings (sell/reduce only allowed when held)."
         ]
     else:
         notes = parsed.get("ranker_notes", [])
@@ -158,16 +235,17 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
         notes = [str(x).strip() for x in notes if str(x).strip()][:4]
         if len(notes) < 2:
             notes = [
-                "Ranking is based on the provided trend, volatility, max_drawdown, and forecast_change_pct.",
-                "This is a simplified educational comparison and may not generalize to other time windows."
+                "Ranking/actions are based on trend, volatility, max_drawdown, and forecast_change_pct in the evidence.",
+                "Sell/reduce actions are only valid for assets held in the wallet (guardrail enforced)."
             ]
 
     return {
         "recommended_symbol": rec,
         "ranking": ranking,
+        "actions": actions,
+        "confidence": conf,
         "ranker_notes": notes
     }
-
 
 def call_ollama_ranker_json(
     evidence: Dict[str, Any],
