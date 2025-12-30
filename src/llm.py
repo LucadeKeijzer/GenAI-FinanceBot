@@ -47,6 +47,46 @@ def fallback_rank_from_evidence(evidence: Dict[str, Any]) -> List[str]:
     ranked = sorted(assets, key=score, reverse=True)
     return [a["symbol"] for a in ranked if "symbol" in a]
 
+def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    rec = parsed.get("recommended_symbol")
+    ranking = parsed.get("ranking", [])
+
+    # Basic validity checks
+    valid = isinstance(ranking, list) and ranking and all(isinstance(s, str) for s in ranking)
+    valid = valid and all(s in allowed_symbols for s in ranking)
+    valid = valid and len(set(ranking)) == len(ranking)
+
+    # Must contain all expected symbols exactly once
+    valid = valid and set(ranking) == set(allowed_symbols)
+
+    # rec must be valid and be the top-ranked symbol
+    valid = valid and isinstance(rec, str) and rec in allowed_symbols and ranking and ranking[0] == rec
+
+    if not valid:
+        ranking = fallback_rank_from_evidence(evidence)
+        # Ensure fallback includes all symbols (defensive)
+        ranking = [s for s in ranking if s in allowed_symbols]
+        for s in allowed_symbols:
+            if s not in ranking:
+                ranking.append(s)
+        rec = ranking[0] if ranking else (allowed_symbols[0] if allowed_symbols else None)
+
+    # ranker_notes cleaning
+    notes = parsed.get("ranker_notes", [])
+    if not isinstance(notes, list):
+        notes = []
+    notes = [str(x).strip() for x in notes if str(x).strip()][:4]
+    if len(notes) < 2:
+        notes = [
+            "Ranking is based on the provided trend, volatility, max_drawdown, and forecast_change_pct.",
+            "This is a simplified educational comparison and may not generalize to other time windows."
+        ]
+
+    return {
+        "recommended_symbol": rec,
+        "ranking": ranking,
+        "ranker_notes": notes
+    }
 
 def normalize_llm_output(parsed: Dict[str, Any], allowed_symbols: List[str], evidence: Dict[str, Any]) -> Dict[str, Any]:
     rec = parsed.get("recommended_symbol")
@@ -100,6 +140,42 @@ def normalize_llm_output(parsed: Dict[str, Any], allowed_symbols: List[str], evi
 
     return parsed
 
+def _make_ranker_prompt(evidence: Dict[str, Any]) -> str:
+    symbols = [a["symbol"] for a in evidence.get("assets", [])]
+
+    example = {
+        "recommended_symbol": symbols[0] if symbols else "SPY",
+        "ranking": symbols,
+        "ranker_notes": [
+            "Top pick has the strongest forecast_change_pct in this dataset.",
+            "Second is more stable (lower volatility) but shows less upside signal here.",
+            "Third has worse drawdown/volatility tradeoffs in this window."
+        ]
+    }
+
+    return f"""
+You are an educational long-term investing assistant. You are NOT a financial advisor.
+Use ONLY the DATA below. Do NOT add external facts.
+
+Return ONLY valid JSON (no markdown, no extra text).
+All items in ranking and ranker_notes MUST be STRINGS.
+
+Allowed symbols:
+{json.dumps(symbols)}
+
+Required JSON schema:
+{{
+  "recommended_symbol": "one of allowed symbols",
+  "ranking": ["all allowed symbols exactly once, best to worst"],
+  "ranker_notes": ["2-4 SHORT string bullets that justify the ranking using ONLY: trend, volatility, max_drawdown, forecast_change_pct"]
+}}
+
+Example of correct format (follow structure only):
+{json.dumps(example, indent=2)}
+
+DATA:
+{json.dumps(evidence, indent=2)}
+""".strip()
 
 def _make_prompt(evidence: Dict[str, Any]) -> str:
     symbols = [a["symbol"] for a in evidence["assets"]]
@@ -144,15 +220,8 @@ DATA:
 {json.dumps(evidence, indent=2)}
 """.strip()
 
-def run_ranker_llm(
-    evidence: Dict[str, Any],
-    model: str = "llama3.2:1b",
-) -> Tuple[Dict[str, Any], str]:
-    """
-    GenAI Ranker — decides ranking + recommended_symbol.
-    (v0.2: explanation still included temporarily)
-    """
-    return call_ollama_json(evidence, model=model)
+def run_ranker_llm(evidence: Dict[str, Any], model: str = "llama3.2:1b") -> Tuple[Dict[str, Any], str]:
+    return call_ollama_ranker_json(evidence, model=model)
 
 def run_explainer_llm(
     final_ranking: List[str],
@@ -164,6 +233,76 @@ def run_explainer_llm(
     (v0.2 placeholder: reuses existing LLM behavior for now)
     """
     return call_ollama_json(evidence, model=model)
+
+def call_ollama_ranker_json(
+    evidence: Dict[str, Any],
+    model: str = "llama3.2:1b",
+    url: str = "http://localhost:11434/api/generate",
+    timeout_s: int = 60
+) -> Tuple[Dict[str, Any], str]:
+    prompt = _make_ranker_prompt(evidence)
+    allowed = [a["symbol"] for a in evidence.get("assets", [])]
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "num_ctx": 1024,
+            "num_predict": 240
+        }
+    }
+
+    try:
+        r = requests.post(url, json=payload, timeout=timeout_s)
+        if r.status_code != 200:
+            fallback = {
+                "recommended_symbol": None,
+                "ranking": fallback_rank_from_evidence(evidence),
+                "ranker_notes": [f"(Ollama error {r.status_code})"]
+            }
+            return normalize_ranker_output(fallback, allowed, evidence), r.text
+
+        raw = r.json().get("response", "").strip()
+
+    except Exception as e:
+        fallback = {
+            "recommended_symbol": None,
+            "ranking": fallback_rank_from_evidence(evidence),
+            "ranker_notes": ["(Request to Ollama failed.)"]
+        }
+        return normalize_ranker_output(fallback, allowed, evidence), str(e)
+
+    # Parse JSON (same strategy as call_ollama_json)
+    try:
+        parsed = json.loads(raw)
+        return normalize_ranker_output(parsed, allowed, evidence), raw
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(raw[start:end + 1])
+            return normalize_ranker_output(parsed, allowed, evidence), raw
+        except Exception:
+            pass
+
+    if raw.strip().startswith("{") and not raw.strip().endswith("}"):
+        try:
+            parsed = json.loads(raw.strip() + "\n}")
+            return normalize_ranker_output(parsed, allowed, evidence), raw
+        except Exception:
+            pass
+
+    fallback = {
+        "recommended_symbol": None,
+        "ranking": fallback_rank_from_evidence(evidence),
+        "ranker_notes": ["(Model output could not be parsed as JSON.)"]
+    }
+    return normalize_ranker_output(fallback, allowed, evidence), raw
 
 def call_ollama_json(
     evidence: Dict[str, Any],
