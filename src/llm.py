@@ -62,7 +62,10 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
     # rec must be valid and be the top-ranked symbol
     valid = valid and isinstance(rec, str) and rec in allowed_symbols and ranking and ranking[0] == rec
 
+    used_fallback = False
+
     if not valid:
+        used_fallback = True
         ranking = fallback_rank_from_evidence(evidence)
         # Ensure fallback includes all symbols (defensive)
         ranking = [s for s in ranking if s in allowed_symbols]
@@ -72,15 +75,21 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
         rec = ranking[0] if ranking else (allowed_symbols[0] if allowed_symbols else None)
 
     # ranker_notes cleaning
-    notes = parsed.get("ranker_notes", [])
-    if not isinstance(notes, list):
-        notes = []
-    notes = [str(x).strip() for x in notes if str(x).strip()][:4]
-    if len(notes) < 2:
+    if used_fallback:
         notes = [
-            "Ranking is based on the provided trend, volatility, max_drawdown, and forecast_change_pct.",
-            "This is a simplified educational comparison and may not generalize to other time windows."
+            "The model output was structurally invalid, so a deterministic fallback ranking was used.",
+            "Fallback ranking is based on forecast_change_pct, volatility, and max_drawdown from the evidence."
         ]
+    else:
+        notes = parsed.get("ranker_notes", [])
+        if not isinstance(notes, list):
+            notes = []
+        notes = [str(x).strip() for x in notes if str(x).strip()][:4]
+        if len(notes) < 2:
+            notes = [
+                "Ranking is based on the provided trend, volatility, max_drawdown, and forecast_change_pct.",
+                "This is a simplified educational comparison and may not generalize to other time windows."
+            ]
 
     return {
         "recommended_symbol": rec,
