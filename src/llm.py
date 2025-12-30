@@ -149,6 +149,52 @@ def normalize_llm_output(parsed: Dict[str, Any], allowed_symbols: List[str], evi
 
     return parsed
 
+def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    headline = parsed.get("headline", "")
+    if not isinstance(headline, str):
+        headline = str(headline)
+
+    explanation = parsed.get("explanation", [])
+    if not isinstance(explanation, list):
+        explanation = []
+    explanation = [str(x).strip() for x in explanation if str(x).strip()][:4]
+
+    tradeoffs = parsed.get("key_tradeoffs", [])
+    if not isinstance(tradeoffs, list):
+        tradeoffs = []
+    tradeoffs = [str(x).strip() for x in tradeoffs if str(x).strip()][:3]
+
+    risks = parsed.get("risks", [])
+    if not isinstance(risks, list):
+        risks = []
+    risks = [str(x).strip() for x in risks if str(x).strip()][:5]
+
+    # De-duplicate risks vs explanation/tradeoffs
+    used = set(explanation) | set(tradeoffs)
+    risks = [r for r in risks if r not in used]
+
+    if len(risks) < 3:
+        risks = [
+            "Forecasts are based on historical patterns and may fail if market regimes change.",
+            "Volatile assets can experience large drawdowns that take years to recover from.",
+            "This comparison depends on the chosen time window and limited metrics."
+        ]
+
+    disclaimer = parsed.get("disclaimer", "")
+    if not isinstance(disclaimer, str) or not disclaimer.strip():
+        disclaimer = "Educational only, not financial advice."
+
+    if not headline.strip():
+        headline = "Based on the evidence, the top-ranked asset is the recommended focus in this set."
+
+    return {
+        "headline": headline.strip(),
+        "explanation": explanation,
+        "key_tradeoffs": tradeoffs,
+        "risks": risks,
+        "disclaimer": disclaimer.strip()
+    }
+
 def _make_ranker_prompt(evidence: Dict[str, Any]) -> str:
     symbols = [a["symbol"] for a in evidence.get("assets", [])]
 
@@ -229,6 +275,73 @@ DATA:
 {json.dumps(evidence, indent=2)}
 """.strip()
 
+def _make_explainer_prompt(
+    evidence: Dict[str, Any],
+    final_ranking: List[str],
+    recommended_symbol: str,
+    ranker_notes: List[str] | None = None,
+) -> str:
+    symbols = [a["symbol"] for a in evidence.get("assets", [])]
+    ranker_notes = ranker_notes or []
+
+    example = {
+        "headline": "Based on the evidence, SPY is the top long-term candidate in this set.",
+        "explanation": [
+            "SPY ranks first mainly because its forecast_change_pct is strongest in this dataset while volatility is relatively lower.",
+            "BTC-USD ranks second due to stronger upside signals but higher volatility and drawdown risk in this window.",
+            "ETH-USD ranks third given the tradeoffs shown in the evidence packet."
+        ],
+        "key_tradeoffs": [
+            "Upside signal (forecast_change_pct) vs stability (volatility).",
+            "Max drawdown highlights potential pain during market stress.",
+            "Trend labels depend on the chosen time window."
+        ],
+        "risks": [
+            "Forecasts are based on historical patterns and may fail in new market regimes.",
+            "High volatility can cause drawdowns that take years to recover from.",
+            "A limited historical window may overweight recent conditions."
+        ],
+        "disclaimer": "Educational only, not financial advice."
+    }
+
+    return f"""
+You are an educational long-term investing assistant. You are NOT a financial advisor.
+Use ONLY the DATA below. Do NOT add external facts.
+
+You MUST explain the FINAL ranking provided. You are NOT allowed to change the ranking.
+Do NOT output a new ranking. Do NOT recommend a different symbol.
+
+Return ONLY valid JSON (no markdown, no extra text).
+All list items MUST be STRINGS.
+
+Allowed symbols:
+{json.dumps(symbols)}
+
+FINAL RANKING (must be explained exactly):
+{json.dumps(final_ranking)}
+
+RECOMMENDED SYMBOL (must match rank #1):
+{json.dumps(recommended_symbol)}
+
+Optional ranker notes (may help keep consistency):
+{json.dumps(ranker_notes)}
+
+Required JSON schema:
+{{
+  "headline": "1 sentence",
+  "explanation": ["2-4 short paragraphs or bullets explaining WHY the final ranking makes sense using ONLY: trend, volatility, max_drawdown, forecast_change_pct"],
+  "key_tradeoffs": ["3 short bullets (comparisons/tradeoffs)"],
+  "risks": ["3-5 short bullets (general limitations, do NOT repeat explanation)"],
+  "disclaimer": "Educational only, not financial advice."
+}}
+
+Example of correct format (follow structure only):
+{json.dumps(example, indent=2)}
+
+DATA:
+{json.dumps(evidence, indent=2)}
+""".strip()
+
 def run_ranker_llm(evidence: Dict[str, Any], model: str = "llama3.2:1b") -> Tuple[Dict[str, Any], str]:
     return call_ollama_ranker_json(evidence, model=model)
 
@@ -236,12 +349,18 @@ def run_explainer_llm(
     final_ranking: List[str],
     evidence: Dict[str, Any],
     model: str = "llama3.2:1b",
+    recommended_symbol: str | None = None,
+    ranker_notes: List[str] | None = None,
 ) -> Tuple[Dict[str, Any], str]:
-    """
-    GenAI Explainer — explains a given ranking.
-    (v0.2 placeholder: reuses existing LLM behavior for now)
-    """
-    return call_ollama_json(evidence, model=model)
+    if recommended_symbol is None:
+        recommended_symbol = final_ranking[0] if final_ranking else ""
+    return call_ollama_explainer_json(
+        evidence=evidence,
+        final_ranking=final_ranking,
+        recommended_symbol=recommended_symbol,
+        ranker_notes=ranker_notes,
+        model=model
+    )
 
 def call_ollama_ranker_json(
     evidence: Dict[str, Any],
@@ -312,6 +431,84 @@ def call_ollama_ranker_json(
         "ranker_notes": ["(Model output could not be parsed as JSON.)"]
     }
     return normalize_ranker_output(fallback, allowed, evidence), raw
+
+def call_ollama_explainer_json(
+    evidence: Dict[str, Any],
+    final_ranking: List[str],
+    recommended_symbol: str,
+    ranker_notes: List[str] | None = None,
+    model: str = "llama3.2:1b",
+    url: str = "http://localhost:11434/api/generate",
+    timeout_s: int = 60
+) -> Tuple[Dict[str, Any], str]:
+    prompt = _make_explainer_prompt(evidence, final_ranking, recommended_symbol, ranker_notes=ranker_notes)
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.4,
+            "num_ctx": 1024,
+            "num_predict": 380
+        }
+    }
+
+    try:
+        r = requests.post(url, json=payload, timeout=timeout_s)
+        if r.status_code != 200:
+            fallback = normalize_explainer_output({
+                "headline": f"(Ollama error {r.status_code})",
+                "explanation": ["Could not generate explanation from local model."],
+                "key_tradeoffs": [],
+                "risks": ["Local model call failed; try rerunning or changing the model."],
+                "disclaimer": "Educational only, not financial advice."
+            })
+            return fallback, r.text
+
+        raw = r.json().get("response", "").strip()
+
+    except Exception as e:
+        fallback = normalize_explainer_output({
+            "headline": "(Request to Ollama failed.)",
+            "explanation": ["Could not generate explanation due to an error."],
+            "key_tradeoffs": [],
+            "risks": [str(e)],
+            "disclaimer": "Educational only, not financial advice."
+        })
+        return fallback, str(e)
+
+    # Parse JSON (same strategy)
+    try:
+        parsed = json.loads(raw)
+        return normalize_explainer_output(parsed), raw
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(raw[start:end + 1])
+            return normalize_explainer_output(parsed), raw
+        except Exception:
+            pass
+
+    if raw.strip().startswith("{") and not raw.strip().endswith("}"):
+        try:
+            parsed = json.loads(raw.strip() + "\n}")
+            return normalize_explainer_output(parsed), raw
+        except Exception:
+            pass
+
+    fallback = normalize_explainer_output({
+        "headline": "(Model output could not be parsed as JSON.)",
+        "explanation": ["LLM output parsing failed; try rerunning or changing the model."],
+        "key_tradeoffs": [],
+        "risks": [],
+        "disclaimer": "Educational only, not financial advice."
+    })
+    return fallback, raw
 
 def call_ollama_json(
     evidence: Dict[str, Any],
