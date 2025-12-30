@@ -33,7 +33,11 @@ def _forecast_change_pct(last_price: float, forecast_end: float) -> float:
     return (forecast_end / last_price) - 1.0
 
 
-def build_evidence_packet(results: Dict[str, Any]) -> Dict[str, Any]:
+def build_evidence_packet(
+    results: Dict[str, Any],
+    user_settings: Optional[Dict[str, Any]] = None,
+    wallet: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Build a compact, comparable evidence packet from AssetResult objects.
     Keeps the payload small for light local models.
@@ -51,11 +55,19 @@ def build_evidence_packet(results: Dict[str, Any]) -> Dict[str, Any]:
             "forecast_change_pct": round(_forecast_change_pct(last_price, forecast_end), 4),
         })
 
-    return {
+    evidence = {
         "task": "Compare assets for long-term investing (educational).",
         "assets": assets
     }
 
+    # v0.3 Step 4: inject context (optional)
+    if user_settings is not None:
+        evidence["user_settings"] = user_settings
+
+    if wallet is not None:
+        evidence["wallet"] = wallet
+
+    return evidence
 
 def fallback_rank_from_evidence(evidence: Dict[str, Any]) -> List[str]:
     assets = evidence.get("assets", [])

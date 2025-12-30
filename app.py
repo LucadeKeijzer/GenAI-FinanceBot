@@ -155,7 +155,19 @@ def main():
     with st.spinner("Analyzing assets..."):
         results = compute_all_assets(candidates, PERIOD, FORECAST_DAYS)
 
-    evidence = build_evidence_packet(results)
+    evidence = build_evidence_packet(
+        results,
+        user_settings={
+            "experience_level": settings.experience_level,
+            "budget_range": settings.budget_range,
+            "detail_level": settings.detail_level,
+            "language": settings.language,
+        },
+        wallet={
+            "source": wallet.source,
+            "positions": wallet.positions,
+        }
+    )
 
     with st.spinner("Generating GenAI ranking (Ranker)..."):
         ranker_output, raw_ranker = run_ranker_llm(evidence, model=OLLAMA_MODEL)
