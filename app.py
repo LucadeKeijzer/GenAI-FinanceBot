@@ -13,7 +13,7 @@ from src.llm import build_evidence_packet, run_ranker_llm, run_explainer_llm
 OLLAMA_MODEL = "llama3.2:1b"
 FORECAST_DAYS = 90
 
-st.set_page_config(page_title="FinanceBot v0.3", layout="wide")
+st.set_page_config(page_title="FinanceBot", layout="wide")
 
 
 # -----------------------------
@@ -194,7 +194,14 @@ def metric_insight(evidence: dict, selected_symbols: list[str], detail_level: st
 # Main app
 # -----------------------------
 def main():
-    st.title("📈 FinanceBot v0.3")
+    col1, col2 = st.columns([1, 6])
+
+    with col1:
+        st.image("assets/logo.png", width=80)
+
+    with col2:
+        st.title("FinanceBot")
+        st.caption("Your financial assistant")
 
     # Load persisted settings (UserSettings dataclass)
     settings = load_user_settings()
@@ -223,13 +230,6 @@ def main():
                     help="Simple = plain language. Advanced = may include limited numeric references."
                 )
 
-                lang = st.selectbox(
-                    "Language",
-                    ["English"],
-                    index=0,
-                    help="Dutch is optional and can be added later."
-                )
-
                 submitted = st.form_submit_button("Save settings")
 
             if submitted:
@@ -237,7 +237,7 @@ def main():
                     experience_level=exp,
                     budget_range=budget,
                     detail_level=detail,
-                    language=lang,
+                    language="English",
                 )
                 save_user_settings(new_settings)
                 st.success("Settings saved.")
