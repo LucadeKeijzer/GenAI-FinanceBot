@@ -382,7 +382,7 @@ def main():
 
     if selected_symbols:
         fig = build_interactive_chart(results, selected_symbols)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         insight = metric_insight(evidence, selected_symbols, settings.detail_level)
         if insight:
