@@ -4,3 +4,4 @@ matplotlib
 fastapi
 uvicorn
 requests
+plotly

@@ -73,9 +73,9 @@ def fallback_rank_from_evidence(evidence: Dict[str, Any]) -> List[str]:
     assets = evidence.get("assets", [])
 
     def score(a: Dict[str, Any]) -> float:
-        fc = float(a.get("forecast_change_pct", 0.0))
-        vol = float(a.get("volatility", 0.0))
-        mdd = float(a.get("max_drawdown", 0.0))
+        fc = float(a.get("forecast_change_pct") or 0.0)
+        vol = float(a.get("volatility") or 0.0)
+        mdd = float(a.get("max_drawdown") or 0.0)
         # Higher forecast_change_pct better; lower volatility better; less-negative drawdown better.
         return fc - 0.25 * vol + 0.15 * mdd
 
