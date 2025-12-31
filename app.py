@@ -4,7 +4,7 @@ import pandas as pd
 
 from src.pipeline import run_asset_pipeline
 from src.wallet import load_wallet, wallet_symbols
-from src.settings import load_user_settings
+from src.settings import load_user_settings, save_user_settings, UserSettings
 from src.llm import build_evidence_packet, run_ranker_llm, run_explainer_llm
 
 # -----------------------------
@@ -198,6 +198,50 @@ def main():
 
     # Load persisted settings (UserSettings dataclass)
     settings = load_user_settings()
+
+    with st.sidebar:
+        with st.expander("⚙️ Settings", expanded=False):
+            with st.form("settings_editor"):
+                exp = st.selectbox(
+                    "Experience level",
+                    ["Beginner", "Intermediate", "Advanced"],
+                    index=["Beginner", "Intermediate", "Advanced"].index(settings.experience_level),
+                    help="Controls how technical the explanations feel. Beginner avoids jargon."
+                )
+
+                budget = st.selectbox(
+                    "Budget range",
+                    ["€0–100", "€100–1000", "€1000+"],
+                    index=["€0–100", "€100–1000", "€1000+"].index(settings.budget_range),
+                    help="Used as context for recommendations. FinanceBot does not execute trades."
+                )
+
+                detail = st.selectbox(
+                    "Detail level",
+                    ["Simple", "Advanced"],
+                    index=["Simple", "Advanced"].index(settings.detail_level),
+                    help="Simple = plain language. Advanced = may include limited numeric references."
+                )
+
+                lang = st.selectbox(
+                    "Language",
+                    ["English"],
+                    index=0,
+                    help="Dutch is optional and can be added later."
+                )
+
+                submitted = st.form_submit_button("Save settings")
+
+            if submitted:
+                new_settings = UserSettings(
+                    experience_level=exp,
+                    budget_range=budget,
+                    detail_level=detail,
+                    language=lang,
+                )
+                save_user_settings(new_settings)
+                st.success("Settings saved.")
+                st.rerun()
 
     # Load wallet (Wallet dataclass)
     wallet = load_wallet()
