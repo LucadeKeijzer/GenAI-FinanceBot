@@ -368,112 +368,146 @@ def _make_explainer_prompt(
     recommended_symbol: str,
     ranker_notes: Optional[List[str]] = None,
 ) -> str:
-    symbols = [a["symbol"] for a in evidence.get("assets", [])]
+    symbols = [a.get("symbol") for a in evidence.get("assets", []) if a.get("symbol")]
     ranker_notes = ranker_notes or []
 
     user_settings = evidence.get("user_settings", {}) or {}
-    detail_level = str(user_settings.get("detail_level", "Simple")).strip() or "Simple"
-    experience_level = str(user_settings.get("experience_level", "Beginner")).strip() or "Beginner"
 
-    # Build an example that ALWAYS aligns with the recommended symbol
-    ex_top = recommended_symbol if recommended_symbol in symbols else (symbols[0] if symbols else "ASSET")
-    ex_second = None
-    for s in final_ranking:
-        if s != ex_top:
-            ex_second = s
-            break
-    ex_third = None
-    for s in final_ranking:
-        if s not in {ex_top, ex_second}:
-            ex_third = s
-            break
+    # NOTE:
+    # During the Managing & Controlling phase, detail_level was removed from explainer generation
+    # to reduce output instability. Explanation depth and vocabulary are controlled solely by experience_level.
+    experience_level = str(user_settings.get("experience_level", "Beginner")).strip() or "Beginner"
+    exp_norm = experience_level.lower()
+
+    # Experience-driven explanation depth & numeric expectations
+    if exp_norm == "beginner":
+        n_bullets = 2
+        vocab_rules = (
+            "- Use plain, everyday language only.\n"
+            "- Do NOT use financial jargon: volatility, drawdown, momentum, valuation, diversification.\n"
+            "- Do NOT use numbers or percentages.\n"
+            "- Focus on intuitive reasons only.\n"
+        )
+        numeric_rules = "- Do NOT include any numbers.\n"
+
+    elif exp_norm == "intermediate":
+        n_bullets = 3
+        vocab_rules = (
+            "- Use mostly plain language.\n"
+            "- You MAY use ONE basic finance term (volatility OR drawdown), explained intuitively.\n"
+            "- Avoid heavy jargon.\n"
+            "- Do NOT repeat beginner phrasing; add one extra nuance (comparison or limitation).\n"
+        )
+        numeric_rules = (
+            "- You MAY include at most ONE approximate numeric reference.\n"
+            "- Numbers must be rounded and explained in words (e.g. 'around 15% higher').\n"
+        )
+
+    else:  # Advanced
+        n_bullets = 4
+        vocab_rules = (
+            "- You SHOULD use analytical terms such as volatility, drawdown, and trend.\n"
+            "- Keep explanations precise and educational.\n"
+        )
+        numeric_rules = (
+            "- You SHOULD include 1–2 approximate numeric references where helpful.\n"
+            "- Numbers must be rounded and explained in words (e.g. 'roughly half the volatility').\n"
+        )
+
+    # Example aligned with bullet count (structure hint only)
+    example_expl = [
+        f"{recommended_symbol} shows stronger expected upside than alternatives in this window.",
+        "Its price movements appear more stable compared to other assets.",
+        "Downside risk looks smaller based on historical worst drops.",
+        "Trend signals appear more supportive than peers over this period."
+    ][:n_bullets]
 
     example = {
-        "headline": f"Based on the evidence, {ex_top} is the strongest long-term candidate in this comparison.",
-        "explanation": [
-            f"{ex_top} ranks first because it shows the most favorable overall balance in the evidence for this time window.",
-            f"{ex_second or 'The second-ranked asset'} follows with different upside vs risk tradeoffs.",
-            f"{ex_third or 'The third-ranked asset'} ranks lower due to less favorable signals in the evidence."
-        ],
+        "headline": f"{recommended_symbol} is the top-ranked long-term pick in this comparison.",
+        "explanation": example_expl,
         "key_tradeoffs": [
-            "Upside signal (forecast_change_pct) versus stability (volatility).",
-            "Max drawdown reflects potential downside during market stress.",
-            "Trends depend on the selected historical window."
+            "Expected upside versus stability.",
+            "Potential growth versus downside risk."
         ],
         "risks": [
-            "Forecasts are based on historical data and may not predict future market behavior.",
-            "High volatility can lead to large drawdowns even for strong assets.",
-            "Results depend on the chosen time period and metrics."
+            "Historical patterns may not repeat in future markets.",
+            "Market conditions can change unexpectedly."
         ],
         "disclaimer": "Educational only, not financial advice."
     }
 
     return f"""
-DATA:
-{json.dumps(evidence, indent=2)}
+DATA (JSON):
+{json.dumps(evidence, ensure_ascii=True)}
 
-You are an educational long-term investing assistant. You are NOT a financial advisor.
-Use ONLY the DATA below. Do NOT add external facts.
+ROLE:
+You are an educational long-term investing assistant (NOT financial advice).
+Use ONLY the DATA. Do NOT add external facts.
 
-CRITICAL RULES:
-- The Ranker has already made the FINAL decision.
-- You MUST explain the provided final ranking.
-- You MUST treat "{recommended_symbol}" as the final top pick.
-- You MUST NOT introduce a different top pick or re-rank assets.
-- You MAY mention other assets only for comparison.
+NON-NEGOTIABLE:
+- The Ranker already made the FINAL decision.
+- Explain WHY the top-ranked asset is ranked highest.
+- Treat "{recommended_symbol}" as the final top pick.
+- Do NOT re-rank assets.
+- Output ONE valid JSON object only (no markdown, no extra text).
 
-User experience level:
-{experience_level}
+USER SETTINGS:
+experience_level={experience_level}
 
-User detail level:
-{detail_level}
+HEADLINE RULES:
+- The headline MUST name the recommended symbol.
+- The headline may remain the same across experience levels.
+- Do NOT write phrases like "top pick" or "rank #1".
 
-Headline requirements (IMPORTANT):
-- The "headline" MUST change when the user's experience level or detail level changes.
-- If experience level is "Beginner" OR detail level is "Simple":
-  - Headline must be short (max ~8 words), plain language, no jargon.
-- If experience level is "Intermediate" and detail level is "Advanced":
-  - Headline can be slightly more specific but still readable.
-- If experience level is "Advanced" AND detail level is "Advanced":
-  - Headline must be more analytical (mention at least one concept like risk, volatility, drawdown, valuation, trend, or diversification).
+EXPLANATION RULES (MANDATORY):
+- "explanation" MUST be a JSON array of strings.
+- Provide EXACTLY {n_bullets} explanation bullets.
+- Each bullet MUST focus on a DIFFERENT evidence dimension:
+  1) expected upside
+  2) stability / price swings
+  3) downside risk / worst drops
+  4) trend or momentum (if applicable)
+- Do NOT restate the same idea using different wording.
+- Each bullet must be ONE clear sentence.
+- Do NOT include literal "[" or "]" characters.
 
-Detail level instructions:
-- If detail level is "Simple":
-  - Use plain language.
-  - Avoid unexplained metrics.
-  - Keep it concise and action-oriented.
-- If detail level is "Advanced":
-  - You MAY mention a small number of numeric references (e.g., % change, volatility, drawdown) but keep it understandable.
-  - Still remain educational (not financial advice).
+METRIC TRANSLATION (MANDATORY):
+- NEVER print raw metric keys or labels anywhere (including inside sentences).
+- Forbidden strings (must not appear): forecast_change_pct, max_drawdown, trend_strength.
+- Use natural language terms instead:
+  - forecast_change_pct -> expected upside signal (stronger/weaker)
+  - volatility -> price swings / stability (more/less stable)
+  - max_drawdown -> worst drop / downside risk (bigger/smaller drawdowns)
+  - When discussing downside risk, compare worst drops using words like "smaller/larger worst drops" (do NOT say "half the time").
+  - trend_strength -> trend / momentum (more/less supportive)
+- If you would otherwise write a metric key, rewrite it using the natural language term.
 
-Do NOT repeat the DATA. Do NOT output the evidence JSON. Only output the required JSON schema.
-Return ONLY valid JSON (no markdown, no extra text).
-Use only standard JSON double quotes " (ASCII). Do NOT use smart quotes like “ ” or „.
-All list items MUST be STRINGS.
+VOCABULARY RULES:
+{vocab_rules}
 
-Allowed symbols:
-{json.dumps(symbols)}
+NUMERIC RULES:
+{numeric_rules}
 
-FINAL RANKING (must be explained exactly):
-{json.dumps(final_ranking)}
+FINAL RANKING (already decided):
+{json.dumps(final_ranking, ensure_ascii=True)}
 
-RECOMMENDED SYMBOL (must match rank #1):
-{json.dumps(recommended_symbol)}
+RECOMMENDED SYMBOL:
+{json.dumps(recommended_symbol, ensure_ascii=True)}
 
-Optional ranker notes (may help keep consistency):
-{json.dumps(ranker_notes)}
+OPTIONAL RANKER NOTES:
+{json.dumps(ranker_notes, ensure_ascii=True)}
 
-Required JSON schema:
+REQUIRED JSON SCHEMA:
 {{
-  "headline": "1 sentence summary that MUST name the recommended symbol",
-  "explanation": ["2-4 short bullets that MUST reference the evidence. Each bullet must mention at least TWO of: forecast direction (positive/negative), volatility (higher/lower vs others), max_drawdown (larger/smaller vs others), trend (bullish/bearish). In Simple mode do NOT use numbers; in Advanced mode you may include at most 1-2 metric values total."],
-  "key_tradeoffs": ["2-4 short bullets describing tradeoffs vs other assets"],
-  "risks": ["1-3 short bullets describing general limitations"],
+  "headline": "string",
+  "explanation": ["string", "..."],
+  "key_tradeoffs": ["string", "..."],
+  "risks": ["string", "..."],
   "disclaimer": "Educational only, not financial advice."
 }}
 
-Example of correct format (follow structure only):
-{json.dumps(example, indent=2)}
+Example structure (follow format, not wording):
+{json.dumps(example, ensure_ascii=True)}
 """.strip()
 
 def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
@@ -505,6 +539,26 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
         for x in explanation
         if str(x).strip()
     ][:4]
+
+    # If the model collapses multiple bullets into one string (often bracketed),
+    # split into separate bullet items deterministically.
+    if len(explanation) == 1:
+        one = explanation[0].strip()
+
+        # Strip wrapping brackets if the model included them as literal text
+        if one.startswith("[") and one.endswith("]"):
+            one = one[1:-1].strip()
+
+        # If it contains multiple sentences, split them
+        if ". " in one:
+            parts = [p.strip() for p in one.split(". ") if p.strip()]
+            # Re-add missing periods where needed
+            rebuilt = []
+            for p in parts:
+                if not p.endswith("."):
+                    p = p + "."
+                rebuilt.append(_strip_wrapping_quotes(p))
+            explanation = rebuilt[:4]
 
     # --- Trade-offs ---
     tradeoffs = parsed.get("key_tradeoffs", [])
@@ -565,7 +619,12 @@ def call_ollama_explainer_json(
     url: str = "http://localhost:11434/api/generate",
     timeout_s: int = 180
 ) -> Tuple[Dict[str, Any], str]:
-    prompt = _make_explainer_prompt(evidence, final_ranking, recommended_symbol, ranker_notes=ranker_notes)
+    prompt = _make_explainer_prompt(
+        evidence,
+        final_ranking,
+        recommended_symbol,
+        ranker_notes=ranker_notes
+    )
 
     payload = {
         "model": model,
@@ -580,6 +639,7 @@ def call_ollama_explainer_json(
 
     try:
         r = requests.post(url, json=payload, timeout=timeout_s)
+
         if r.status_code != 200:
             fallback = normalize_explainer_output({
                 "headline": f"(Ollama error {r.status_code})",
@@ -605,19 +665,17 @@ def call_ollama_explainer_json(
 
     try:
         parsed = _extract_first_json_object(raw_clean)
-        return normalize_explainer_output(parsed), raw
+        normalized = normalize_explainer_output(parsed)
+        return normalized, raw
     except Exception:
-        pass
-
-    fallback = normalize_explainer_output({
-        "headline": "[Fallback] Explanation could not be generated reliably",
-        "explanation": ["LLM output parsing failed; try rerunning or changing the model."],
-        "key_tradeoffs": [],
-        "risks": [],
-        "disclaimer": "Educational only, not financial advice."
-    })
-    return fallback, raw
-
+        fallback = normalize_explainer_output({
+            "headline": "[Fallback] Explanation could not be generated reliably",
+            "explanation": ["LLM output parsing failed; try rerunning or changing the model."],
+            "key_tradeoffs": [],
+            "risks": [],
+            "disclaimer": "Educational only, not financial advice."
+        })
+        return fallback, raw
 
 # ----------------------------
 # Public v0.2 wrappers

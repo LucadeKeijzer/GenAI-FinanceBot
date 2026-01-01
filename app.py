@@ -223,20 +223,12 @@ def main():
                     help="Used as context for recommendations. FinanceBot does not execute trades."
                 )
 
-                detail = st.selectbox(
-                    "Detail level",
-                    ["Simple", "Advanced"],
-                    index=["Simple", "Advanced"].index(settings.detail_level),
-                    help="Simple = plain language. Advanced = may include limited numeric references."
-                )
-
                 submitted = st.form_submit_button("Save settings")
 
             if submitted:
                 new_settings = UserSettings(
                     experience_level=exp,
                     budget_range=budget,
-                    detail_level=detail,
                     language="English",
                 )
                 save_user_settings(new_settings)
@@ -298,7 +290,6 @@ def main():
     settings_json = {
         "experience_level": settings.experience_level,
         "budget_range": settings.budget_range,
-        "detail_level": settings.detail_level,
         "language": settings.language,
     }
 
@@ -351,7 +342,6 @@ def main():
 
     # Explainer
     st.subheader("🧠 Explanation")
-    st.caption(f"Explanation detail level: {settings.detail_level}")
     st.markdown(f"**{explainer_output.get('headline', '')}**")
     for b in explainer_output.get("explanation", []):
         st.markdown(f"- {b}")
