@@ -1,6 +1,8 @@
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
+import json
+import hashlib
 
 from src.pipeline import run_asset_pipeline
 from src.wallet import load_wallet, wallet_symbols
@@ -10,7 +12,7 @@ from src.llm import build_evidence_packet, run_ranker_llm, run_explainer_llm
 # -----------------------------
 # App config
 # -----------------------------
-OLLAMA_MODEL = "llama3.2:1b"
+OLLAMA_MODEL = "llama3.2:3b"
 FORECAST_DAYS = 90
 
 st.set_page_config(page_title="FinanceBot", layout="wide")
@@ -308,18 +310,59 @@ def main():
     ranker_user_settings.pop("detail_level", None)
     ranker_evidence["user_settings"] = ranker_user_settings
 
-    # Ranker + Explainer
-    ranker_output, raw_ranker = run_ranker_llm(ranker_evidence, model=OLLAMA_MODEL)
+    # -----------------------------
+    # Ranker (decision-only, cached)
+    # -----------------------------
+
+    # Ranker must NOT depend on communication settings
+    ranker_evidence = dict(evidence)
+    ranker_evidence.pop("user_settings", None)
+
+    # Deterministic hash of decision inputs
+    ranker_key = hashlib.sha256(
+        json.dumps(ranker_evidence, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    if "ranker_cache" not in st.session_state:
+        st.session_state["ranker_cache"] = {}
+
+    if ranker_key in st.session_state["ranker_cache"]:
+        ranker_output, raw_ranker = st.session_state["ranker_cache"][ranker_key]
+    else:
+        ranker_output, raw_ranker = run_ranker_llm(ranker_evidence, model=OLLAMA_MODEL)
+        st.session_state["ranker_cache"][ranker_key] = (ranker_output, raw_ranker)
+
     final_ranking = ranker_output.get("ranking", [])
     recommended_symbol = ranker_output.get("recommended_symbol", "")
 
-    explainer_output, raw_explainer = run_explainer_llm(
-        final_ranking=final_ranking,
-        evidence=evidence,
-        recommended_symbol=recommended_symbol,
-        ranker_notes=ranker_output.get("ranker_notes"),
-        model=OLLAMA_MODEL,
-    )
+# -----------------------------
+# Explainer (cached by ranking + experience)
+# -----------------------------
+    user_settings = evidence.get("user_settings", {}) or {}
+    experience_level = str(user_settings.get("experience_level", "Beginner")).strip()
+
+    explainer_key = hashlib.sha256(
+        json.dumps({
+            "ranking": final_ranking,
+            "recommended": recommended_symbol,
+            "experience_level": experience_level,
+        }, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    if "explainer_cache" not in st.session_state:
+        st.session_state["explainer_cache"] = {}
+
+    if explainer_key in st.session_state["explainer_cache"]:
+        explainer_output, raw_explainer = st.session_state["explainer_cache"][explainer_key]
+    else:
+        explainer_output, raw_explainer = run_explainer_llm(
+            final_ranking=final_ranking,
+            evidence=evidence,  # includes user_settings on purpose
+            recommended_symbol=recommended_symbol,
+            ranker_notes=ranker_output.get("ranker_notes"),
+            model=OLLAMA_MODEL,
+        )
+        st.session_state["explainer_cache"][explainer_key] = (explainer_output, raw_explainer)
 
     # Recommendation + Ranking (restored)
     st.subheader("✅ Recommendation")

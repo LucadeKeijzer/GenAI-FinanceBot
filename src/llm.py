@@ -289,7 +289,7 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
 
 def call_ollama_ranker_json(
     evidence: Dict[str, Any],
-    model: str = "llama3.2:1b",
+    model: str = "llama3.2:3b",
     url: str = "http://localhost:11434/api/generate",
     timeout_s: int = 60
 ) -> Tuple[Dict[str, Any], str]:
@@ -615,7 +615,7 @@ def call_ollama_explainer_json(
     final_ranking: List[str],
     recommended_symbol: str,
     ranker_notes: Optional[List[str]] = None,
-    model: str = "llama3.2:1b",
+    model: str = "llama3.2:3b",
     url: str = "http://localhost:11434/api/generate",
     timeout_s: int = 180
 ) -> Tuple[Dict[str, Any], str]:
@@ -652,7 +652,7 @@ def call_ollama_explainer_json(
 
         raw = r.json().get("response", "").strip()
         raw_clean = _sanitize_json_text(raw)
-
+        
     except Exception as e:
         fallback = normalize_explainer_output({
             "headline": "(Request to Ollama failed.)",
@@ -683,15 +683,14 @@ def call_ollama_explainer_json(
 
 def run_ranker_llm(
     evidence: Dict[str, Any],
-    model: str = "llama3.2:1b",
+    model: str = "llama3.2:3b",
 ) -> Tuple[Dict[str, Any], str]:
     return call_ollama_ranker_json(evidence, model=model)
-
 
 def run_explainer_llm(
     final_ranking: List[str],
     evidence: Dict[str, Any],
-    model: str = "llama3.2:1b",
+    model: str = "llama3.2:3b",
     recommended_symbol: Optional[str] = None,
     ranker_notes: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, Any], str]:
@@ -802,7 +801,7 @@ DATA:
 
 def call_ollama_json(
     evidence: Dict[str, Any],
-    model: str = "llama3.2:1b",
+    model: str = "llama3.2:3b",
     url: str = "http://localhost:11434/api/generate",
     timeout_s: int = 60,
     temperature: float = 0.2,
