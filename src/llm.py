@@ -26,6 +26,25 @@ def _sanitize_json_text(raw: str) -> str:
 
     return raw
 
+def _extract_first_json_object(text: str) -> Dict[str, Any]:
+    """
+    Extract and parse the first valid JSON object from a string.
+    Handles cases where the LLM returns multiple JSON objects back-to-back.
+    """
+    decoder = json.JSONDecoder()
+
+    s = text.strip()
+    start = s.find("{")
+    while start != -1:
+        try:
+            obj, end = decoder.raw_decode(s[start:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+        start = s.find("{", start + 1)
+
+    raise ValueError("No valid JSON object found in LLM output")
 
 def _forecast_change_pct(last_price: float, forecast_end: float) -> float:
     if last_price == 0:
@@ -354,6 +373,7 @@ def _make_explainer_prompt(
 
     user_settings = evidence.get("user_settings", {}) or {}
     detail_level = str(user_settings.get("detail_level", "Simple")).strip() or "Simple"
+    experience_level = str(user_settings.get("experience_level", "Beginner")).strip() or "Beginner"
 
     # Build an example that ALWAYS aligns with the recommended symbol
     ex_top = recommended_symbol if recommended_symbol in symbols else (symbols[0] if symbols else "ASSET")
@@ -402,22 +422,29 @@ CRITICAL RULES:
 - You MUST NOT introduce a different top pick or re-rank assets.
 - You MAY mention other assets only for comparison.
 
+User experience level:
+{experience_level}
+
 User detail level:
 {detail_level}
+
+Headline requirements (IMPORTANT):
+- The "headline" MUST change when the user's experience level or detail level changes.
+- If experience level is "Beginner" OR detail level is "Simple":
+  - Headline must be short (max ~8 words), plain language, no jargon.
+- If experience level is "Intermediate" and detail level is "Advanced":
+  - Headline can be slightly more specific but still readable.
+- If experience level is "Advanced" AND detail level is "Advanced":
+  - Headline must be more analytical (mention at least one concept like risk, volatility, drawdown, valuation, trend, or diversification).
 
 Detail level instructions:
 - If detail level is "Simple":
   - Use plain language.
-  - Avoid unexplained jargon.
-  - Avoid raw metric values unless absolutely necessary.
+  - Avoid unexplained metrics.
+  - Keep it concise and action-oriented.
 - If detail level is "Advanced":
-  - You SHOULD reference key signals from the evidence when they materially support the decision.
-  - When using numbers:
-    - Do NOT mention internal metric names (e.g. do not say "forecast_change_pct").
-    - Translate signals into natural language (e.g. "around 3% upside", "roughly 80% potential increase", "a small expected decline").
-    - If the recommended asset ranks first due to a clearly stronger forecast signal or much lower volatility than others, you MUST include one approximate percentage to justify this.
-    - Use rounded, human-friendly percentages when helpful.
-  - Include at most 1-2 numeric references total.
+  - You MAY mention a small number of numeric references (e.g., % change, volatility, drawdown) but keep it understandable.
+  - Still remain educational (not financial advice).
 
 Do NOT repeat the DATA. Do NOT output the evidence JSON. Only output the required JSON schema.
 Return ONLY valid JSON (no markdown, no extra text).
@@ -456,26 +483,56 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
             s = s[1:-1].strip()
         return s
 
+    parsed = dict(parsed or {})
+
+    # --- Headline ---
     headline = parsed.get("headline", "")
     if not isinstance(headline, str):
         headline = str(headline)
     headline = _strip_wrapping_quotes(headline)
+    if not headline.strip():
+        headline = "Based on the evidence, the top-ranked asset is the recommended focus in this set."
 
+    # --- Explanation ---
     explanation = parsed.get("explanation", [])
-    if not isinstance(explanation, list):
+    if isinstance(explanation, str):
+        explanation = [explanation]
+    elif not isinstance(explanation, list):
         explanation = []
-    explanation = [_strip_wrapping_quotes(str(x).strip()) for x in explanation if str(x).strip()][:4]
 
+    explanation = [
+        _strip_wrapping_quotes(str(x).strip())
+        for x in explanation
+        if str(x).strip()
+    ][:4]
+
+    # --- Trade-offs ---
     tradeoffs = parsed.get("key_tradeoffs", [])
-    if not isinstance(tradeoffs, list):
+    if isinstance(tradeoffs, str):
+        tradeoffs = [tradeoffs]
+    elif not isinstance(tradeoffs, list):
         tradeoffs = []
-    tradeoffs = [_strip_wrapping_quotes(str(x).strip()) for x in tradeoffs if str(x).strip()][:3]
 
+    tradeoffs = [
+        _strip_wrapping_quotes(str(x).strip())
+        for x in tradeoffs
+        if str(x).strip()
+    ][:3]
+
+    # --- Risks ---
     risks = parsed.get("risks", [])
-    if not isinstance(risks, list):
+    if isinstance(risks, str):
+        risks = [risks]
+    elif not isinstance(risks, list):
         risks = []
-    risks = [_strip_wrapping_quotes(str(x).strip()) for x in risks if str(x).strip()][:5]
 
+    risks = [
+        _strip_wrapping_quotes(str(x).strip())
+        for x in risks
+        if str(x).strip()
+    ][:5]
+
+    # Remove duplicates already mentioned elsewhere
     used = set(explanation) | set(tradeoffs)
     risks = [r for r in risks if r not in used]
 
@@ -486,12 +543,10 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
             "This comparison depends on the chosen time window and limited metrics."
         ]
 
+    # --- Disclaimer ---
     disclaimer = parsed.get("disclaimer", "")
     if not isinstance(disclaimer, str) or not disclaimer.strip():
         disclaimer = "Educational only, not financial advice."
-
-    if not headline.strip():
-        headline = "Based on the evidence, the top-ranked asset is the recommended focus in this set."
 
     return {
         "headline": headline.strip(),
@@ -501,7 +556,6 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
         "disclaimer": disclaimer.strip()
     }
 
-
 def call_ollama_explainer_json(
     evidence: Dict[str, Any],
     final_ranking: List[str],
@@ -509,7 +563,7 @@ def call_ollama_explainer_json(
     ranker_notes: Optional[List[str]] = None,
     model: str = "llama3.2:1b",
     url: str = "http://localhost:11434/api/generate",
-    timeout_s: int = 60
+    timeout_s: int = 180
 ) -> Tuple[Dict[str, Any], str]:
     prompt = _make_explainer_prompt(evidence, final_ranking, recommended_symbol, ranker_notes=ranker_notes)
 
@@ -550,26 +604,10 @@ def call_ollama_explainer_json(
         return fallback, str(e)
 
     try:
-        parsed = json.loads(raw_clean)
+        parsed = _extract_first_json_object(raw_clean)
         return normalize_explainer_output(parsed), raw
     except Exception:
         pass
-
-    start = raw_clean.find("{")
-    end = raw_clean.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(raw_clean[start:end + 1])
-            return normalize_explainer_output(parsed), raw
-        except Exception:
-            pass
-
-    if raw_clean.strip().startswith("{") and not raw_clean.strip().endswith("}"):
-        try:
-            parsed = json.loads(raw_clean.strip() + "\n}")
-            return normalize_explainer_output(parsed), raw
-        except Exception:
-            pass
 
     fallback = normalize_explainer_output({
         "headline": "[Fallback] Explanation could not be generated reliably",
