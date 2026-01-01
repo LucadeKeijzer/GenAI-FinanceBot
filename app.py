@@ -369,6 +369,23 @@ def main():
     actions = ranker_output.get("actions", {})
     confidence = ranker_output.get("confidence", "medium")
 
+    with st.expander("How to interpret action and confidence"):
+        st.markdown(
+            """
+    **Suggested action** reflects what the analysis implies *given your current wallet and the evidence*:
+    - **Buy / Increase**: The asset is attractive relative to others and you currently hold little or none.
+    - **Hold**: The asset ranks well but does not clearly justify increasing exposure.
+    - **Reduce / Sell**: The asset ranks lower or carries higher risk relative to alternatives you hold.
+
+    **Confidence** reflects how strong and consistent the supporting signals are:
+    - **High**: Multiple indicators point in the same direction with limited tradeoffs.
+    - **Medium**: Signals are mixed or involve meaningful tradeoffs.
+    - **Low**: Evidence is weak, conflicting, or highly sensitive to assumptions.
+
+    This tool is educational only and does not provide financial advice.
+    """
+        )
+
     if recommended_symbol:
         rec_action = actions.get(recommended_symbol, "consider")
         st.markdown(f"**Recommended asset:** `{recommended_symbol}`")
