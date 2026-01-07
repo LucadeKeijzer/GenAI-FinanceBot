@@ -166,7 +166,7 @@ def fallback_rank_from_evidence(evidence: Dict[str, Any]) -> List[str]:
 # ----------------------------
 
 def _make_ranker_prompt(evidence: Dict[str, Any]) -> str:
-    symbols = [a["symbol"] for a in evidence.get("assets", [])]
+    symbols = [a["symbol"] for a in evidence.get("assets", []) if a.get("symbol")]
 
     wallet_positions = (evidence.get("wallet") or {}).get("positions", [])
     held_symbols: List[str] = []
@@ -181,59 +181,32 @@ def _make_ranker_prompt(evidence: Dict[str, Any]) -> str:
 
     allowed_actions = ["consider", "add", "hold", "reduce", "sell", "avoid"]
 
-    example_actions = {s: ("hold" if s in held_symbols else "consider") for s in symbols}
-    if symbols:
-        example_actions[symbols[0]] = "hold" if symbols[0] in held_symbols else "add"
+    # DATA compact (no pretty indent)
+    data_json = json.dumps(evidence, ensure_ascii=True)
 
-    example = {
-        "recommended_symbol": symbols[0] if symbols else "SPY",
-        "ranking": symbols,
-        "actions": example_actions,
-        "confidence": "medium",
-        "ranker_notes": [
-            "Top pick has the strongest forecast_change_pct in this dataset.",
-            "Second is more stable (lower volatility) but shows less upside signal here.",
-            "Third has worse drawdown/volatility tradeoffs in this window."
-        ]
+    # Keep the schema explicit but short (no example)
+    schema = {
+        "recommended_symbol": "one of allowed symbols",
+        "ranking": ["all allowed symbols exactly once, best to worst"],
+        "actions": {"SYMBOL": "one allowed action (must include ALL symbols)"},
+        "confidence": "low|medium|high",
+        "ranker_notes": ["2-4 short strings using ONLY the provided data"]
     }
 
-    return f"""
-You are an educational long-term investing assistant. You are NOT a financial advisor.
-Use ONLY the DATA below. Do NOT add external facts.
-
-Return ONLY valid JSON (no markdown, no extra text).
-Use only standard JSON double quotes " (ASCII). Do NOT use smart quotes like “ ” or „.
-All items in ranking and ranker_notes MUST be STRINGS.
-
-Allowed symbols:
-{json.dumps(symbols)}
-
-Allowed actions:
-{json.dumps(allowed_actions)}
-
-Wallet held symbols (quantity > 0):
-{json.dumps(held_symbols)}
-
-Action rule:
-- "sell" and "reduce" are ONLY allowed for symbols that are held in the wallet.
-- For symbols not held, use: consider / add / hold / avoid (NOT sell/reduce).
-
-Required JSON schema:
-{{
-  "recommended_symbol": "one of allowed symbols",
-  "ranking": ["all allowed symbols exactly once, best to worst"],
-  "actions": {{"SYMBOL": "one allowed action" (must include ALL symbols)}},
-  "confidence": "low|medium|high",
-  "ranker_notes": ["2-4 SHORT string bullets that justify ranking/actions using ONLY: trend, volatility, max_drawdown, forecast_change_pct, plus wallet context"]
-}}
-
-Example of correct format (follow structure only):
-{json.dumps(example, indent=2)}
-
-DATA:
-{json.dumps(evidence, indent=2)}
-""".strip()
-
+    return (
+        "You are an educational long-term investing assistant (NOT financial advice).\n"
+        "Use ONLY the DATA. Do NOT add external facts.\n"
+        "Return ONE valid JSON object only (no markdown, no extra text).\n"
+        "All items in ranking and ranker_notes MUST be strings.\n\n"
+        f"Allowed symbols: {json.dumps(symbols, ensure_ascii=True)}\n"
+        f"Allowed actions: {json.dumps(allowed_actions, ensure_ascii=True)}\n"
+        f"Held symbols (qty>0): {json.dumps(held_symbols, ensure_ascii=True)}\n\n"
+        "Action rule:\n"
+        '- "sell" and "reduce" are ONLY allowed for symbols that are held.\n'
+        '- For symbols not held, use consider/add/hold/avoid (NOT sell/reduce).\n\n'
+        f"Required JSON schema: {json.dumps(schema, ensure_ascii=True)}\n\n"
+        f"DATA: {data_json}"
+    )
 
 def normalize_ranker_output(
     parsed: Dict[str, Any],
@@ -360,7 +333,7 @@ def call_ollama_ranker_json(
         "options": {
             "temperature": 0.0,
             "num_ctx": 1024,
-            "num_predict": 350
+            "num_predict": 160
         }
     }
 
