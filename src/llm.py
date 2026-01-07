@@ -4,6 +4,10 @@ from typing import Dict, Any, Tuple, List, Optional
 import requests
 
 
+# ----------------------------
+# Small utilities
+# ----------------------------
+
 def _sanitize_json_text(raw: str) -> str:
     """
     Local LLMs sometimes emit smart quotes or odd unicode quotes that break JSON.
@@ -26,6 +30,7 @@ def _sanitize_json_text(raw: str) -> str:
 
     return raw
 
+
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
     """
     Extract and parse the first valid JSON object from a string.
@@ -33,11 +38,11 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
     """
     decoder = json.JSONDecoder()
 
-    s = text.strip()
+    s = (text or "").strip()
     start = s.find("{")
     while start != -1:
         try:
-            obj, end = decoder.raw_decode(s[start:])
+            obj, _end = decoder.raw_decode(s[start:])
             if isinstance(obj, dict):
                 return obj
         except json.JSONDecodeError:
@@ -46,11 +51,65 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
 
     raise ValueError("No valid JSON object found in LLM output")
 
+
+def _robust_json_parse(text: str) -> Dict[str, Any]:
+    """
+    Try multiple deterministic strategies to parse a JSON object from text.
+    Used for ranker output (which should be ONE JSON object).
+    """
+    s = (text or "").strip()
+
+    # 1) direct
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # 2) slice first {...last}
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            obj = json.loads(s[start:end + 1])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    # 3) try adding closing brace (common truncation)
+    if s.startswith("{") and not s.endswith("}"):
+        try:
+            obj = json.loads(s + "\n}")
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    raise ValueError("Could not parse JSON object from model output")
+
+
+def _with_prompt_chars(out: Dict[str, Any], prompt_chars: int) -> Dict[str, Any]:
+    """
+    Attach prompt character count for metrics, without breaking if types are odd.
+    """
+    try:
+        out["_prompt_chars"] = int(prompt_chars)
+    except Exception:
+        out["_prompt_chars"] = 0
+    return out
+
+
 def _forecast_change_pct(last_price: float, forecast_end: float) -> float:
     if last_price == 0:
         return 0.0
     return (forecast_end / last_price) - 1.0
 
+
+# ----------------------------
+# Evidence & deterministic fallback
+# ----------------------------
 
 def build_evidence_packet(
     results: Dict[str, Any],
@@ -58,7 +117,7 @@ def build_evidence_packet(
     wallet: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Build a compact, comparable evidence packet from AssetResult objects.
+    Build a compact evidence packet from AssetResult objects.
     Keeps the payload small for light local models.
     """
     assets = []
@@ -74,19 +133,19 @@ def build_evidence_packet(
             "forecast_change_pct": round(_forecast_change_pct(last_price, forecast_end), 4),
         })
 
-    evidence = {
+    evidence: Dict[str, Any] = {
         "task": "Compare assets for long-term investing (educational).",
         "assets": assets
     }
 
-    # v0.3 Step 4: inject context (optional)
+    # Inject context (optional)
     if user_settings is not None:
         evidence["user_settings"] = user_settings
-
     if wallet is not None:
         evidence["wallet"] = wallet
 
     return evidence
+
 
 def fallback_rank_from_evidence(evidence: Dict[str, Any]) -> List[str]:
     assets = evidence.get("assets", [])
@@ -103,14 +162,14 @@ def fallback_rank_from_evidence(evidence: Dict[str, Any]) -> List[str]:
 
 
 # ----------------------------
-# v0.2 Ranker (decision only)
+# Ranker (decision only)
 # ----------------------------
 
 def _make_ranker_prompt(evidence: Dict[str, Any]) -> str:
     symbols = [a["symbol"] for a in evidence.get("assets", [])]
 
     wallet_positions = (evidence.get("wallet") or {}).get("positions", [])
-    held_symbols = []
+    held_symbols: List[str] = []
     for p in wallet_positions:
         try:
             sym = str(p.get("symbol", "")).strip()
@@ -124,7 +183,6 @@ def _make_ranker_prompt(evidence: Dict[str, Any]) -> str:
 
     example_actions = {s: ("hold" if s in held_symbols else "consider") for s in symbols}
     if symbols:
-        # Example: top pick usually "add" (or "hold" if already held)
         example_actions[symbols[0]] = "hold" if symbols[0] in held_symbols else "add"
 
     example = {
@@ -176,11 +234,16 @@ DATA:
 {json.dumps(evidence, indent=2)}
 """.strip()
 
-def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], evidence: Dict[str, Any]) -> Dict[str, Any]:
+
+def normalize_ranker_output(
+    parsed: Dict[str, Any],
+    allowed_symbols: List[str],
+    evidence: Dict[str, Any]
+) -> Dict[str, Any]:
     rec = parsed.get("recommended_symbol")
     ranking = parsed.get("ranking", [])
 
-    # --- validate ranking (existing v0.2 logic) ---
+    # Validate ranking
     valid = isinstance(ranking, list) and ranking and all(isinstance(s, str) for s in ranking)
     valid = valid and all(s in allowed_symbols for s in ranking)
     valid = valid and len(set(ranking)) == len(ranking)
@@ -197,7 +260,7 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
                 ranking.append(s)
         rec = ranking[0] if ranking else (allowed_symbols[0] if allowed_symbols else None)
 
-    # --- wallet held symbols (for action guardrail) ---
+    # Wallet held symbols
     wallet_positions = (evidence.get("wallet") or {}).get("positions", [])
     held = set()
     for p in wallet_positions:
@@ -211,7 +274,7 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
 
     allowed_actions = {"consider", "add", "hold", "reduce", "sell", "avoid"}
 
-    # --- actions normalization (new in v0.3 Step 5) ---
+    # Actions normalization
     actions_in = parsed.get("actions", {})
     actions: Dict[str, str] = {}
 
@@ -219,31 +282,23 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
         for sym in allowed_symbols:
             act = actions_in.get(sym)
             if isinstance(act, str):
-                act = act.strip().lower()
-                actions[sym] = act
+                actions[sym] = act.strip().lower()
 
-    # fill defaults for missing/invalid actions
+    # Fill defaults for missing/invalid actions
     for sym in allowed_symbols:
         if sym not in actions or actions[sym] not in allowed_actions:
             actions[sym] = "hold" if sym in held else "consider"
 
-    # hard guardrail: sell/reduce only if held
+    # Hard guardrail: sell/reduce only if held
     for sym in allowed_symbols:
         if actions[sym] in {"sell", "reduce"} and sym not in held:
             actions[sym] = "avoid"
 
-    # hard guardrail: sell/reduce only if held
-    for sym in allowed_symbols:
-        if actions[sym] in {"sell", "reduce"} and sym not in held:
-            actions[sym] = "avoid"
-
-    # soft consistency guardrail:
-    # if forecast is meaningfully negative, don't "consider/add" a NOT-held asset
+    # Soft consistency: if forecast meaningfully negative, don't consider/add a not-held asset
     asset_by_symbol = {a["symbol"]: a for a in evidence.get("assets", [])}
     for sym in allowed_symbols:
         a = asset_by_symbol.get(sym, {})
         fc = a.get("forecast_change_pct", None)
-
         try:
             fc = float(fc)
         except Exception:
@@ -253,7 +308,7 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
         if not_held and fc < -0.02 and actions.get(sym) in {"consider", "add"}:
             actions[sym] = "avoid"
 
-    # --- confidence normalization ---
+    # Confidence normalization
     conf = parsed.get("confidence", "medium")
     if not isinstance(conf, str):
         conf = "medium"
@@ -261,7 +316,7 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
     if conf not in {"low", "medium", "high"}:
         conf = "medium"
 
-    # --- notes normalization (existing) ---
+    # Notes normalization
     if used_fallback:
         notes = [
             "The model output was structurally invalid, so a deterministic fallback ranking was used.",
@@ -287,6 +342,7 @@ def normalize_ranker_output(parsed: Dict[str, Any], allowed_symbols: List[str], 
         "ranker_notes": notes
     }
 
+
 def call_ollama_ranker_json(
     evidence: Dict[str, Any],
     model: str = "llama3.2:3b",
@@ -308,8 +364,10 @@ def call_ollama_ranker_json(
         }
     }
 
+    raw = ""
     try:
         r = requests.post(url, json=payload, timeout=timeout_s)
+
         if r.status_code != 200:
             fallback = {
                 "recommended_symbol": None,
@@ -317,10 +375,9 @@ def call_ollama_ranker_json(
                 "ranker_notes": [f"(Ollama error {r.status_code})"]
             }
             out = normalize_ranker_output(fallback, allowed, evidence)
-            out["_prompt_chars"] = prompt_chars
-            return out, r.text
+            return _with_prompt_chars(out, prompt_chars), r.text
 
-        raw = r.json().get("response", "").strip()
+        raw = (r.json().get("response", "") or "").strip()
         raw_clean = _sanitize_json_text(raw)
 
     except Exception as e:
@@ -330,45 +387,21 @@ def call_ollama_ranker_json(
             "ranker_notes": ["(Request to Ollama failed.)"]
         }
         out = normalize_ranker_output(fallback, allowed, evidence)
-        out["_prompt_chars"] = prompt_chars
-        return out, str(e)
+        return _with_prompt_chars(out, prompt_chars), str(e)
 
     try:
-        parsed = json.loads(raw_clean)
+        parsed = _robust_json_parse(raw_clean)
         out = normalize_ranker_output(parsed, allowed, evidence)
-        out["_prompt_chars"] = prompt_chars
-        return out, raw
+        return _with_prompt_chars(out, prompt_chars), raw
     except Exception:
-        pass
+        fallback = {
+            "recommended_symbol": None,
+            "ranking": fallback_rank_from_evidence(evidence),
+            "ranker_notes": ["(Model output could not be parsed as JSON.)"]
+        }
+        out = normalize_ranker_output(fallback, allowed, evidence)
+        return _with_prompt_chars(out, prompt_chars), raw
 
-    start = raw_clean.find("{")
-    end = raw_clean.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(raw_clean[start:end + 1])
-            out = normalize_ranker_output(parsed, allowed, evidence)
-            out["_prompt_chars"] = prompt_chars
-            return out, raw
-        except Exception:
-            pass
-
-    if raw_clean.strip().startswith("{") and not raw_clean.strip().endswith("}"):
-        try:
-            parsed = json.loads(raw_clean.strip() + "\n}")
-            out = normalize_ranker_output(parsed, allowed, evidence)
-            out["_prompt_chars"] = prompt_chars
-            return out, raw
-        except Exception:
-            pass
-
-    fallback = {
-        "recommended_symbol": None,
-        "ranking": fallback_rank_from_evidence(evidence),
-        "ranker_notes": ["(Model output could not be parsed as JSON.)"]
-    }
-    out = normalize_ranker_output(fallback, allowed, evidence)
-    out["_prompt_chars"] = prompt_chars
-    return out, raw
 
 # ----------------------------
 # Explainer (explain only)
@@ -380,18 +413,13 @@ def _make_explainer_prompt(
     recommended_symbol: str,
     ranker_notes: Optional[List[str]] = None,
 ) -> str:
-    symbols = [a.get("symbol") for a in evidence.get("assets", []) if a.get("symbol")]
     ranker_notes = ranker_notes or []
-
     user_settings = evidence.get("user_settings", {}) or {}
 
-    # NOTE:
-    # During the Managing & Controlling phase, detail_level was removed from explainer generation
-    # to reduce output instability. Explanation depth and vocabulary are controlled solely by experience_level.
+    # Explanation depth and vocabulary are controlled by experience_level.
     experience_level = str(user_settings.get("experience_level", "Beginner")).strip() or "Beginner"
     exp_norm = experience_level.lower()
 
-    # Experience-driven explanation depth & numeric expectations
     if exp_norm == "beginner":
         n_bullets = 2
         vocab_rules = (
@@ -426,7 +454,6 @@ def _make_explainer_prompt(
             "- Numbers must be rounded and explained in words (e.g. 'roughly half the volatility').\n"
         )
 
-    # Example aligned with bullet count (structure hint only)
     example_expl = [
         f"{recommended_symbol} shows stronger expected upside than alternatives in this window.",
         "Its price movements appear more stable compared to other assets.",
@@ -522,6 +549,7 @@ Example structure (follow format, not wording):
 {json.dumps(example, ensure_ascii=True)}
 """.strip()
 
+
 def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
     def _strip_wrapping_quotes(s: str) -> str:
         s = s.strip()
@@ -531,7 +559,6 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
     parsed = dict(parsed or {})
 
-    # --- Headline ---
     headline = parsed.get("headline", "")
     if not isinstance(headline, str):
         headline = str(headline)
@@ -539,7 +566,6 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
     if not headline.strip():
         headline = "Based on the evidence, the top-ranked asset is the recommended focus in this set."
 
-    # --- Explanation ---
     explanation = parsed.get("explanation", [])
     if isinstance(explanation, str):
         explanation = [explanation]
@@ -552,19 +578,14 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
         if str(x).strip()
     ][:4]
 
-    # If the model collapses multiple bullets into one string (often bracketed),
-    # split into separate bullet items deterministically.
+    # If model collapses multiple bullets into one string, split deterministically.
     if len(explanation) == 1:
         one = explanation[0].strip()
-
-        # Strip wrapping brackets if the model included them as literal text
         if one.startswith("[") and one.endswith("]"):
             one = one[1:-1].strip()
 
-        # If it contains multiple sentences, split them
         if ". " in one:
             parts = [p.strip() for p in one.split(". ") if p.strip()]
-            # Re-add missing periods where needed
             rebuilt = []
             for p in parts:
                 if not p.endswith("."):
@@ -572,33 +593,28 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
                 rebuilt.append(_strip_wrapping_quotes(p))
             explanation = rebuilt[:4]
 
-    # --- Trade-offs ---
     tradeoffs = parsed.get("key_tradeoffs", [])
     if isinstance(tradeoffs, str):
         tradeoffs = [tradeoffs]
     elif not isinstance(tradeoffs, list):
         tradeoffs = []
-
     tradeoffs = [
         _strip_wrapping_quotes(str(x).strip())
         for x in tradeoffs
         if str(x).strip()
     ][:3]
 
-    # --- Risks ---
     risks = parsed.get("risks", [])
     if isinstance(risks, str):
         risks = [risks]
     elif not isinstance(risks, list):
         risks = []
-
     risks = [
         _strip_wrapping_quotes(str(x).strip())
         for x in risks
         if str(x).strip()
     ][:5]
 
-    # Remove duplicates already mentioned elsewhere
     used = set(explanation) | set(tradeoffs)
     risks = [r for r in risks if r not in used]
 
@@ -609,7 +625,6 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
             "This comparison depends on the chosen time window and limited metrics."
         ]
 
-    # --- Disclaimer ---
     disclaimer = parsed.get("disclaimer", "")
     if not isinstance(disclaimer, str) or not disclaimer.strip():
         disclaimer = "Educational only, not financial advice."
@@ -621,6 +636,7 @@ def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
         "risks": risks,
         "disclaimer": disclaimer.strip()
     }
+
 
 def call_ollama_explainer_json(
     evidence: Dict[str, Any],
@@ -650,6 +666,7 @@ def call_ollama_explainer_json(
         }
     }
 
+    raw = ""
     try:
         r = requests.post(url, json=payload, timeout=timeout_s)
 
@@ -661,12 +678,11 @@ def call_ollama_explainer_json(
                 "risks": ["Local model call failed; try rerunning or changing the model."],
                 "disclaimer": "Educational only, not financial advice."
             })
-            fallback["_prompt_chars"] = prompt_chars
-            return fallback, r.text
+            return _with_prompt_chars(fallback, prompt_chars), r.text
 
-        raw = r.json().get("response", "").strip()
+        raw = (r.json().get("response", "") or "").strip()
         raw_clean = _sanitize_json_text(raw)
-        
+
     except Exception as e:
         fallback = normalize_explainer_output({
             "headline": "(Request to Ollama failed.)",
@@ -675,14 +691,12 @@ def call_ollama_explainer_json(
             "risks": [str(e)],
             "disclaimer": "Educational only, not financial advice."
         })
-        fallback["_prompt_chars"] = prompt_chars
-        return fallback, str(e)
+        return _with_prompt_chars(fallback, prompt_chars), str(e)
 
     try:
         parsed = _extract_first_json_object(raw_clean)
         normalized = normalize_explainer_output(parsed)
-        normalized["_prompt_chars"] = prompt_chars
-        return normalized, raw
+        return _with_prompt_chars(normalized, prompt_chars), raw
     except Exception:
         fallback = normalize_explainer_output({
             "headline": "[Fallback] Explanation could not be generated reliably",
@@ -691,14 +705,19 @@ def call_ollama_explainer_json(
             "risks": [],
             "disclaimer": "Educational only, not financial advice."
         })
-        fallback["_prompt_chars"] = prompt_chars
-        return fallback, raw
+        return _with_prompt_chars(fallback, prompt_chars), raw
+
+
+# ----------------------------
+# Public wrappers
+# ----------------------------
 
 def run_ranker_llm(
     evidence: Dict[str, Any],
     model: str = "llama3.2:3b",
 ) -> Tuple[Dict[str, Any], str]:
     return call_ollama_ranker_json(evidence, model=model)
+
 
 def run_explainer_llm(
     final_ranking: List[str],
