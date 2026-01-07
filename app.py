@@ -1,14 +1,16 @@
-import streamlit as st
-import plotly.graph_objects as go
-import pandas as pd
-import json
 import hashlib
+import json
 
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from metrics import RunMetrics, Timer
+from src.llm import build_evidence_packet, run_explainer_llm, run_ranker_llm
 from src.pipeline import run_asset_pipeline
+from src.settings import UserSettings, load_user_settings, save_user_settings
 from src.wallet import load_wallet, wallet_symbols
-from src.settings import load_user_settings, save_user_settings, UserSettings
-from src.llm import build_evidence_packet, run_ranker_llm, run_explainer_llm
-from metrics import RunMetrics, Timer, append_jsonl
+
 
 # -----------------------------
 # App config
@@ -24,7 +26,6 @@ st.set_page_config(page_title="FinanceBot", layout="wide")
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def cached_run_asset_pipeline(symbol: str, period: str, forecast_days: int):
-    # Cache per (symbol, period, forecast_days)
     return run_asset_pipeline(symbol=symbol, period=period, forecast_days=forecast_days)
 
 
@@ -61,26 +62,25 @@ def build_interactive_chart(results: dict, symbols: list[str]) -> go.Figure:
     normalize = len(symbols) > 1
     fig = go.Figure()
 
+    y_title = "Price"
+    if normalize:
+        y_title = "Normalized value (start = 100)"
+
     for sym in symbols:
         r = results.get(sym)
         if r is None:
             continue
 
-        # Ensure 1D series
         prices = r.prices["Close"].squeeze().dropna()
         if getattr(prices, "ndim", 1) != 1 or prices.empty:
             continue
 
-        df = pd.DataFrame(
-            {"date": prices.index, "price": prices.values}
-        )
+        df = pd.DataFrame({"date": prices.index, "price": prices.values})
 
         if normalize:
             df["value"] = (df["price"] / df["price"].iloc[0]) * 100.0
-            y_title = "Normalized value (start = 100)"
         else:
             df["value"] = df["price"]
-            y_title = "Price"
 
         vol = r.metrics.get("volatility", 0.0)
         dd = r.metrics.get("max_drawdown", 0.0)
@@ -121,7 +121,6 @@ def metric_insight(evidence: dict, selected_symbols: list[str], detail_level: st
     if len(selected_symbols) < 2:
         return None
 
-    # Compare first two selected to keep it concise
     a, b = selected_symbols[0], selected_symbols[1]
     assets = {x.get("symbol"): x for x in evidence.get("assets", [])}
     aa = assets.get(a)
@@ -129,49 +128,27 @@ def metric_insight(evidence: dict, selected_symbols: list[str], detail_level: st
     if not aa or not bb:
         return None
 
-    vola = aa.get("volatility")
-    volb = bb.get("volatility")
-    dda = aa.get("max_drawdown")
-    ddb = bb.get("max_drawdown")
-    fca = aa.get("forecast_change_pct")
-    fcb = bb.get("forecast_change_pct")
+    def _f(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
 
-    # Robust casts
-    try:
-        vola = float(vola)
-    except Exception:
-        vola = None
-    try:
-        volb = float(volb)
-    except Exception:
-        volb = None
-    try:
-        dda = float(dda)
-    except Exception:
-        dda = None
-    try:
-        ddb = float(ddb)
-    except Exception:
-        ddb = None
-    try:
-        fca = float(fca)
-    except Exception:
-        fca = None
-    try:
-        fcb = float(fcb)
-    except Exception:
-        fcb = None
+    vola = _f(aa.get("volatility"))
+    volb = _f(bb.get("volatility"))
+    dda = _f(aa.get("max_drawdown"))
+    ddb = _f(bb.get("max_drawdown"))
+    fca = _f(aa.get("forecast_change_pct"))
+    fcb = _f(bb.get("forecast_change_pct"))
 
     parts = []
 
-    # Stability comparison
     if vola is not None and volb is not None:
         if vola < volb:
             parts.append(f"{a} looks more stable than {b} over this period.")
         elif volb < vola:
             parts.append(f"{b} looks more stable than {a} over this period.")
 
-    # Drawdown comparison
     if dda is not None and ddb is not None:
         # drawdown is negative; closer to 0 is "smaller drawdowns"
         if dda > ddb:
@@ -179,17 +156,17 @@ def metric_insight(evidence: dict, selected_symbols: list[str], detail_level: st
         elif ddb > dda:
             parts.append(f"{b} had smaller drawdowns than {a}.")
 
-    # Advanced: allow ONE rounded % if it helps
     if detail_level == "Advanced" and (fca is not None) and (fcb is not None):
         if abs(fca - fcb) >= 0.02:
             stronger = a if fca > fcb else b
-            pct = round(max(fca, fcb) * 100)  # 0.027 -> 3%
-            parts.append(f"{stronger} also shows a stronger upside signal, around {pct}% over the forecast horizon.")
+            pct = round(max(fca, fcb) * 100)
+            parts.append(
+                f"{stronger} also shows a stronger upside signal, around {pct}% over the forecast horizon."
+            )
 
     if not parts:
         return None
 
-    # Keep it short
     return " ".join(parts[:3])
 
 
@@ -206,20 +183,20 @@ def main():
         st.title("FinanceBot")
         st.caption("Your financial assistant")
 
+    # Load persisted settings (UserSettings dataclass)
+    settings = load_user_settings()
+
     # --- Metrics init ---
     if "metrics_runs" not in st.session_state:
         st.session_state["metrics_runs"] = []
 
     m = RunMetrics()
-    m.set("app_version", "v0.3")  # of git hash later
+    m.set("app_version", "v0.3")
 
-    # Load persisted settings (UserSettings dataclass)
-    settings = load_user_settings()
-
+    # Determine run reason (best-effort)
     prev_exp = st.session_state.get("_prev_experience_level")
     current_exp = settings.experience_level
 
-    # Best-effort reason detection
     run_reason = "initial"
     if prev_exp is not None and prev_exp != current_exp:
         run_reason = "experience_change"
@@ -228,6 +205,7 @@ def main():
     m.set("experience_level", current_exp)
     st.session_state["_prev_experience_level"] = current_exp
 
+    # Sidebar: settings
     with st.sidebar:
         with st.expander("⚙️ Settings", expanded=False):
             with st.form("settings_editor"):
@@ -257,6 +235,7 @@ def main():
                 st.success("Settings saved.")
                 st.rerun()
 
+    # Wallet
     with Timer(m, "wallet_load_seconds"):
         wallet = load_wallet()
     m.set("wallet_source", wallet.source)
@@ -288,11 +267,10 @@ def main():
     # Candidate universe = wallet + starter list (locked design)
     starter = ["BTC-USD", "ETH-USD", "SPY", "SOL-USD"]
     candidates = sorted(set(starter + wallet_symbols(wallet)))
-
-    # Compute results (cached per symbol/period)
     m.set("candidate_symbols_count", len(candidates))
     m.set("period", period)
 
+    # Compute results (cached per symbol/period)
     results = {}
     failed = []
 
@@ -325,13 +303,13 @@ def main():
         "language": settings.language,
     }
 
-    # Wallet JSON-safe dict (positions already list-of-dicts)
+    # Wallet JSON-safe dict
     wallet_json = {
         "source": wallet.source,
         "positions": wallet.positions,
     }
 
-    # Build evidence using your existing helper (prevents None forecast values)
+    # Build evidence packet
     with Timer(m, "evidence_build_seconds"):
         evidence = build_evidence_packet(results, user_settings=settings_json, wallet=wallet_json)
 
@@ -339,21 +317,12 @@ def main():
     evidence_chars = len(json.dumps(evidence, ensure_ascii=True, sort_keys=True))
     m.set("evidence_chars", evidence_chars)
 
-    # Ranker should NOT see detail_level (communication-only)
-    ranker_evidence = dict(evidence)
-    ranker_user_settings = dict(ranker_evidence.get("user_settings", {}))
-    ranker_user_settings.pop("detail_level", None)
-    ranker_evidence["user_settings"] = ranker_user_settings
-
     # -----------------------------
     # Ranker (decision-only, cached)
     # -----------------------------
-
-    # Ranker must NOT depend on communication settings
     ranker_evidence = dict(evidence)
-    ranker_evidence.pop("user_settings", None)
+    ranker_evidence.pop("user_settings", None)  # ranker must not depend on communication settings
 
-    # Deterministic hash of decision inputs
     ranker_key = hashlib.sha256(
         json.dumps(ranker_evidence, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -371,16 +340,25 @@ def main():
             ranker_output, raw_ranker = run_ranker_llm(ranker_evidence, model=OLLAMA_MODEL)
             st.session_state["ranker_cache"][ranker_key] = (ranker_output, raw_ranker)
 
-    m.set("ranker_ran", not m.data["ranker_cache_hit"])
+    m.set("ranker_ran", not bool(m.data.get("ranker_cache_hit")))
     m.set("ranker_prompt_chars", int(ranker_output.get("_prompt_chars", 0)) if isinstance(ranker_output, dict) else 0)
     m.set("ranker_response_chars", len(raw_ranker or ""))
 
     final_ranking = ranker_output.get("ranking", [])
     recommended_symbol = ranker_output.get("recommended_symbol", "")
 
-# -----------------------------
-# Explainer (cached by ranking + experience)
-# -----------------------------
+    m.set(
+        "ranker_ran_on_experience_change",
+        bool(m.data.get("ranker_ran")) and m.data.get("run_reason") == "experience_change"
+    )
+    m.set(
+        "ranker_should_have_been_cached",
+        m.data.get("run_reason") == "experience_change"
+    )
+
+    # -----------------------------
+    # Explainer (cached by ranking + experience)
+    # -----------------------------
     user_settings = evidence.get("user_settings", {}) or {}
     experience_level = str(user_settings.get("experience_level", "Beginner")).strip()
 
@@ -404,34 +382,25 @@ def main():
         else:
             explainer_output, raw_explainer = run_explainer_llm(
                 final_ranking=final_ranking,
-                evidence=evidence,
+                evidence=evidence,  # includes user_settings on purpose
                 recommended_symbol=recommended_symbol,
                 ranker_notes=ranker_output.get("ranker_notes"),
                 model=OLLAMA_MODEL,
             )
             st.session_state["explainer_cache"][explainer_key] = (explainer_output, raw_explainer)
 
-    m.set("explainer_ran", not m.data["explainer_cache_hit"])
+    m.set("explainer_ran", not bool(m.data.get("explainer_cache_hit")))
     m.set("explainer_prompt_chars", int(explainer_output.get("_prompt_chars", 0)) if isinstance(explainer_output, dict) else 0)
     m.set("explainer_response_chars", len(raw_explainer or ""))
 
-    # Guardrails
-    m.set(
-        "ranker_ran_on_experience_change",
-        (m.data.get("run_reason") == "experience_change") and bool(m.data.get("ranker_ran"))
-    )
-
     m.set(
         "explainer_ran_on_experience_change",
-        (m.data.get("run_reason") == "experience_change") and bool(m.data.get("explainer_ran"))
+        bool(m.data.get("explainer_ran")) and m.data.get("run_reason") == "experience_change"
     )
 
-    m.set(
-        "ranker_should_have_been_cached",
-        m.data.get("run_reason") == "experience_change"
-    )
-
-    # Recommendation + Ranking (restored)
+    # -----------------------------
+    # Recommendation + Ranking UI
+    # -----------------------------
     st.subheader("✅ Recommendation")
     actions = ranker_output.get("actions", {})
     confidence = ranker_output.get("confidence", "medium")
@@ -439,18 +408,18 @@ def main():
     with st.expander("How to interpret action and confidence"):
         st.markdown(
             """
-    **Suggested action** reflects what the analysis implies *given your current wallet and the evidence*:
-    - **Buy / Increase**: The asset is attractive relative to others and you currently hold little or none.
-    - **Hold**: The asset ranks well but does not clearly justify increasing exposure.
-    - **Reduce / Sell**: The asset ranks lower or carries higher risk relative to alternatives you hold.
+**Suggested action** reflects what the analysis implies *given your current wallet and the evidence*:
+- **Buy / Increase**: The asset is attractive relative to others and you currently hold little or none.
+- **Hold**: The asset ranks well but does not clearly justify increasing exposure.
+- **Reduce / Sell**: The asset ranks lower or carries higher risk relative to alternatives you hold.
 
-    **Confidence** reflects how strong and consistent the supporting signals are:
-    - **High**: Multiple indicators point in the same direction with limited tradeoffs.
-    - **Medium**: Signals are mixed or involve meaningful tradeoffs.
-    - **Low**: Evidence is weak, conflicting, or highly sensitive to assumptions.
+**Confidence** reflects how strong and consistent the supporting signals are:
+- **High**: Multiple indicators point in the same direction with limited tradeoffs.
+- **Medium**: Signals are mixed or involve meaningful tradeoffs.
+- **Low**: Evidence is weak, conflicting, or highly sensitive to assumptions.
 
-    This tool is educational only and does not provide financial advice.
-    """
+This tool is educational only and does not provide financial advice.
+"""
         )
 
     if recommended_symbol:
@@ -467,7 +436,7 @@ def main():
     else:
         st.warning("Ranking is empty. Check raw ranker output in debug.")
 
-    # Explainer
+    # Explainer UI
     st.subheader("🧠 Explanation")
     st.markdown(f"**{explainer_output.get('headline', '')}**")
     for b in explainer_output.get("explanation", []):
@@ -479,7 +448,6 @@ def main():
     # -----------------------------
     # One chart + selection controls
     # -----------------------------
-    # Default selection: top 2 from ranking that are actually available
     ranked_available = [s for s in final_ranking if s in available_symbols]
     default_symbols = ranked_available[:2] if len(ranked_available) >= 2 else available_symbols[:2]
 
@@ -491,7 +459,6 @@ def main():
         help="Select one asset for a historical view, or multiple assets for a normalized comparison."
     )
 
-    # Chart title AFTER selection (prevents UnboundLocalError)
     if len(selected_symbols) <= 1:
         st.subheader("📈 Price history")
     else:
@@ -507,13 +474,6 @@ def main():
     else:
         st.caption("Select at least one asset to show the chart.")
 
-    final_metrics = m.finish()
-    st.session_state["last_metrics"] = final_metrics
-    st.session_state["metrics_runs"].append(final_metrics)
-    append_jsonl("logs/metrics.jsonl", final_metrics)
-
-    with st.expander("🧪 Debug: last run metrics"):
-        st.json(final_metrics)
 
 if __name__ == "__main__":
     main()
