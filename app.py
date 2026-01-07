@@ -1,11 +1,11 @@
 import hashlib
 import json
-
+import time
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from metrics import RunMetrics, Timer
+from metrics import RunMetrics, Timer, append_jsonl
 from src.llm import build_evidence_packet, run_explainer_llm, run_ranker_llm
 from src.pipeline import run_asset_pipeline
 from src.settings import UserSettings, load_user_settings, save_user_settings
@@ -19,7 +19,6 @@ OLLAMA_MODEL = "llama3.2:3b"
 FORECAST_DAYS = 90
 
 st.set_page_config(page_title="FinanceBot", layout="wide")
-
 
 # -----------------------------
 # Deterministic cache (adds real UX value)
@@ -191,6 +190,7 @@ def main():
         st.session_state["metrics_runs"] = []
 
     m = RunMetrics()
+    run_start = time.perf_counter()
     m.set("app_version", "v0.3")
 
     # Determine run reason (best-effort)
@@ -474,6 +474,13 @@ This tool is educational only and does not provide financial advice.
     else:
         st.caption("Select at least one asset to show the chart.")
 
+    # -----------------------------
+    # Finalize & persist metrics
+    # -----------------------------
+    m.set("report_total_seconds", time.perf_counter() - run_start)
+    m.set("ts_unix", time.time())
+
+    append_jsonl("logs/metrics.jsonl" ,m.data)
 
 if __name__ == "__main__":
     main()

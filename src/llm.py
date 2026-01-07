@@ -360,7 +360,7 @@ def call_ollama_ranker_json(
         "options": {
             "temperature": 0.0,
             "num_ctx": 1024,
-            "num_predict": 300
+            "num_predict": 350
         }
     }
 
@@ -662,7 +662,7 @@ def call_ollama_explainer_json(
         "options": {
             "temperature": 0.0,
             "num_ctx": 1024,
-            "num_predict": 700
+            "num_predict": 350
         }
     }
 
