@@ -294,6 +294,7 @@ def call_ollama_ranker_json(
     timeout_s: int = 60
 ) -> Tuple[Dict[str, Any], str]:
     prompt = _make_ranker_prompt(evidence)
+    prompt_chars = len(prompt)
     allowed = [a["symbol"] for a in evidence.get("assets", [])]
 
     payload = {
@@ -315,7 +316,9 @@ def call_ollama_ranker_json(
                 "ranking": fallback_rank_from_evidence(evidence),
                 "ranker_notes": [f"(Ollama error {r.status_code})"]
             }
-            return normalize_ranker_output(fallback, allowed, evidence), r.text
+            out = normalize_ranker_output(fallback, allowed, evidence)
+            out["_prompt_chars"] = prompt_chars
+            return out, r.text
 
         raw = r.json().get("response", "").strip()
         raw_clean = _sanitize_json_text(raw)
@@ -326,11 +329,15 @@ def call_ollama_ranker_json(
             "ranking": fallback_rank_from_evidence(evidence),
             "ranker_notes": ["(Request to Ollama failed.)"]
         }
-        return normalize_ranker_output(fallback, allowed, evidence), str(e)
+        out = normalize_ranker_output(fallback, allowed, evidence)
+        out["_prompt_chars"] = prompt_chars
+        return out, str(e)
 
     try:
         parsed = json.loads(raw_clean)
-        return normalize_ranker_output(parsed, allowed, evidence), raw
+        out = normalize_ranker_output(parsed, allowed, evidence)
+        out["_prompt_chars"] = prompt_chars
+        return out, raw
     except Exception:
         pass
 
@@ -339,14 +346,18 @@ def call_ollama_ranker_json(
     if start != -1 and end != -1 and end > start:
         try:
             parsed = json.loads(raw_clean[start:end + 1])
-            return normalize_ranker_output(parsed, allowed, evidence), raw
+            out = normalize_ranker_output(parsed, allowed, evidence)
+            out["_prompt_chars"] = prompt_chars
+            return out, raw
         except Exception:
             pass
 
     if raw_clean.strip().startswith("{") and not raw_clean.strip().endswith("}"):
         try:
             parsed = json.loads(raw_clean.strip() + "\n}")
-            return normalize_ranker_output(parsed, allowed, evidence), raw
+            out = normalize_ranker_output(parsed, allowed, evidence)
+            out["_prompt_chars"] = prompt_chars
+            return out, raw
         except Exception:
             pass
 
@@ -355,8 +366,9 @@ def call_ollama_ranker_json(
         "ranking": fallback_rank_from_evidence(evidence),
         "ranker_notes": ["(Model output could not be parsed as JSON.)"]
     }
-    return normalize_ranker_output(fallback, allowed, evidence), raw
-
+    out = normalize_ranker_output(fallback, allowed, evidence)
+    out["_prompt_chars"] = prompt_chars
+    return out, raw
 
 # ----------------------------
 # v0.2 Explainer (explain only)
@@ -625,6 +637,7 @@ def call_ollama_explainer_json(
         recommended_symbol,
         ranker_notes=ranker_notes
     )
+    prompt_chars = len(prompt)
 
     payload = {
         "model": model,
@@ -648,6 +661,7 @@ def call_ollama_explainer_json(
                 "risks": ["Local model call failed; try rerunning or changing the model."],
                 "disclaimer": "Educational only, not financial advice."
             })
+            fallback["_prompt_chars"] = prompt_chars
             return fallback, r.text
 
         raw = r.json().get("response", "").strip()
@@ -661,11 +675,13 @@ def call_ollama_explainer_json(
             "risks": [str(e)],
             "disclaimer": "Educational only, not financial advice."
         })
+        fallback["_prompt_chars"] = prompt_chars
         return fallback, str(e)
 
     try:
         parsed = _extract_first_json_object(raw_clean)
         normalized = normalize_explainer_output(parsed)
+        normalized["_prompt_chars"] = prompt_chars
         return normalized, raw
     except Exception:
         fallback = normalize_explainer_output({
@@ -675,6 +691,7 @@ def call_ollama_explainer_json(
             "risks": [],
             "disclaimer": "Educational only, not financial advice."
         })
+        fallback["_prompt_chars"] = prompt_chars
         return fallback, raw
 
 # ----------------------------

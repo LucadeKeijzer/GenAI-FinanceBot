@@ -8,6 +8,7 @@ from src.pipeline import run_asset_pipeline
 from src.wallet import load_wallet, wallet_symbols
 from src.settings import load_user_settings, save_user_settings, UserSettings
 from src.llm import build_evidence_packet, run_ranker_llm, run_explainer_llm
+from metrics import RunMetrics, Timer, append_jsonl
 
 # -----------------------------
 # App config
@@ -205,8 +206,27 @@ def main():
         st.title("FinanceBot")
         st.caption("Your financial assistant")
 
+    # --- Metrics init ---
+    if "metrics_runs" not in st.session_state:
+        st.session_state["metrics_runs"] = []
+
+    m = RunMetrics()
+    m.set("app_version", "v0.3")  # of git hash later
+
     # Load persisted settings (UserSettings dataclass)
     settings = load_user_settings()
+
+    prev_exp = st.session_state.get("_prev_experience_level")
+    current_exp = settings.experience_level
+
+    # Best-effort reason detection
+    run_reason = "initial"
+    if prev_exp is not None and prev_exp != current_exp:
+        run_reason = "experience_change"
+
+    m.set("run_reason", run_reason)
+    m.set("experience_level", current_exp)
+    st.session_state["_prev_experience_level"] = current_exp
 
     with st.sidebar:
         with st.expander("⚙️ Settings", expanded=False):
@@ -237,8 +257,10 @@ def main():
                 st.success("Settings saved.")
                 st.rerun()
 
-    # Load wallet (Wallet dataclass)
-    wallet = load_wallet()
+    with Timer(m, "wallet_load_seconds"):
+        wallet = load_wallet()
+    m.set("wallet_source", wallet.source)
+    m.set("wallet_positions_count", len(wallet.positions or []))
 
     with st.sidebar:
         st.header("Wallet")
@@ -268,14 +290,22 @@ def main():
     candidates = sorted(set(starter + wallet_symbols(wallet)))
 
     # Compute results (cached per symbol/period)
+    m.set("candidate_symbols_count", len(candidates))
+    m.set("period", period)
+
     results = {}
     failed = []
+
     with st.spinner("Loading market data..."):
-        for symbol in candidates:
-            try:
-                results[symbol] = cached_run_asset_pipeline(symbol, period, FORECAST_DAYS)
-            except Exception:
-                failed.append(symbol)
+        with Timer(m, "asset_pipeline_total_seconds"):
+            for symbol in candidates:
+                try:
+                    results[symbol] = cached_run_asset_pipeline(symbol, period, FORECAST_DAYS)
+                except Exception:
+                    failed.append(symbol)
+
+    m.set("symbols_loaded_count", len(results))
+    m.set("symbols_failed_count", len(failed))
 
     if failed:
         st.warning(
@@ -302,7 +332,12 @@ def main():
     }
 
     # Build evidence using your existing helper (prevents None forecast values)
-    evidence = build_evidence_packet(results, user_settings=settings_json, wallet=wallet_json)
+    with Timer(m, "evidence_build_seconds"):
+        evidence = build_evidence_packet(results, user_settings=settings_json, wallet=wallet_json)
+
+    # prompt-size driver: evidence chars
+    evidence_chars = len(json.dumps(evidence, ensure_ascii=True, sort_keys=True))
+    m.set("evidence_chars", evidence_chars)
 
     # Ranker should NOT see detail_level (communication-only)
     ranker_evidence = dict(evidence)
@@ -326,11 +361,19 @@ def main():
     if "ranker_cache" not in st.session_state:
         st.session_state["ranker_cache"] = {}
 
-    if ranker_key in st.session_state["ranker_cache"]:
-        ranker_output, raw_ranker = st.session_state["ranker_cache"][ranker_key]
-    else:
-        ranker_output, raw_ranker = run_ranker_llm(ranker_evidence, model=OLLAMA_MODEL)
-        st.session_state["ranker_cache"][ranker_key] = (ranker_output, raw_ranker)
+    m.set("ranker_cache_hit", False)
+
+    with Timer(m, "ranker_total_seconds"):
+        if ranker_key in st.session_state["ranker_cache"]:
+            m.set("ranker_cache_hit", True)
+            ranker_output, raw_ranker = st.session_state["ranker_cache"][ranker_key]
+        else:
+            ranker_output, raw_ranker = run_ranker_llm(ranker_evidence, model=OLLAMA_MODEL)
+            st.session_state["ranker_cache"][ranker_key] = (ranker_output, raw_ranker)
+
+    m.set("ranker_ran", not m.data["ranker_cache_hit"])
+    m.set("ranker_prompt_chars", int(ranker_output.get("_prompt_chars", 0)) if isinstance(ranker_output, dict) else 0)
+    m.set("ranker_response_chars", len(raw_ranker or ""))
 
     final_ranking = ranker_output.get("ranking", [])
     recommended_symbol = ranker_output.get("recommended_symbol", "")
@@ -352,17 +395,41 @@ def main():
     if "explainer_cache" not in st.session_state:
         st.session_state["explainer_cache"] = {}
 
-    if explainer_key in st.session_state["explainer_cache"]:
-        explainer_output, raw_explainer = st.session_state["explainer_cache"][explainer_key]
-    else:
-        explainer_output, raw_explainer = run_explainer_llm(
-            final_ranking=final_ranking,
-            evidence=evidence,  # includes user_settings on purpose
-            recommended_symbol=recommended_symbol,
-            ranker_notes=ranker_output.get("ranker_notes"),
-            model=OLLAMA_MODEL,
-        )
-        st.session_state["explainer_cache"][explainer_key] = (explainer_output, raw_explainer)
+    m.set("explainer_cache_hit", False)
+
+    with Timer(m, "explainer_total_seconds"):
+        if explainer_key in st.session_state["explainer_cache"]:
+            m.set("explainer_cache_hit", True)
+            explainer_output, raw_explainer = st.session_state["explainer_cache"][explainer_key]
+        else:
+            explainer_output, raw_explainer = run_explainer_llm(
+                final_ranking=final_ranking,
+                evidence=evidence,
+                recommended_symbol=recommended_symbol,
+                ranker_notes=ranker_output.get("ranker_notes"),
+                model=OLLAMA_MODEL,
+            )
+            st.session_state["explainer_cache"][explainer_key] = (explainer_output, raw_explainer)
+
+    m.set("explainer_ran", not m.data["explainer_cache_hit"])
+    m.set("explainer_prompt_chars", int(explainer_output.get("_prompt_chars", 0)) if isinstance(explainer_output, dict) else 0)
+    m.set("explainer_response_chars", len(raw_explainer or ""))
+
+    # Guardrails
+    m.set(
+        "ranker_ran_on_experience_change",
+        (m.data.get("run_reason") == "experience_change") and bool(m.data.get("ranker_ran"))
+    )
+
+    m.set(
+        "explainer_ran_on_experience_change",
+        (m.data.get("run_reason") == "experience_change") and bool(m.data.get("explainer_ran"))
+    )
+
+    m.set(
+        "ranker_should_have_been_cached",
+        m.data.get("run_reason") == "experience_change"
+    )
 
     # Recommendation + Ranking (restored)
     st.subheader("✅ Recommendation")
@@ -440,13 +507,13 @@ def main():
     else:
         st.caption("Select at least one asset to show the chart.")
 
-    # Debug
-    with st.expander("🔍 Raw Ranker output (debug)"):
-        st.text(raw_ranker)
+    final_metrics = m.finish()
+    st.session_state["last_metrics"] = final_metrics
+    st.session_state["metrics_runs"].append(final_metrics)
+    append_jsonl("logs/metrics.jsonl", final_metrics)
 
-    with st.expander("🔍 Raw Explainer output (debug)"):
-        st.text(raw_explainer)
-
+    with st.expander("🧪 Debug: last run metrics"):
+        st.json(final_metrics)
 
 if __name__ == "__main__":
     main()

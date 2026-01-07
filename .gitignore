@@ -7,3 +7,9 @@ __pycache__/
 
 # Streamlit
 .streamlit/
+
+# Runtime Logs
+logs/
+
+# Documentation
+documentation/
