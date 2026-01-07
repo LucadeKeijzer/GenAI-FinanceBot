@@ -1,8 +1,8 @@
 import json
-from typing import Dict, Any, Tuple, List, Optional
-
 import requests
+import re
 
+from typing import Dict, Any, Tuple, List, Optional
 
 # ----------------------------
 # Small utilities
@@ -30,6 +30,19 @@ def _sanitize_json_text(raw: str) -> str:
 
     return raw
 
+import re
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    # remove ```json ... ``` or ``` ... ```
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+def _remove_trailing_commas(s: str) -> str:
+    # remove trailing commas before } or ]
+    return re.sub(r",\s*([}\]])", r"\1", s)
 
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
     """
@@ -389,139 +402,77 @@ def _make_explainer_prompt(
     ranker_notes = ranker_notes or []
     user_settings = evidence.get("user_settings", {}) or {}
 
-    # Explanation depth and vocabulary are controlled by experience_level.
     experience_level = str(user_settings.get("experience_level", "Beginner")).strip() or "Beginner"
     exp_norm = experience_level.lower()
 
+    # Experience-driven explanation depth & numeric expectations
     if exp_norm == "beginner":
         n_bullets = 2
         vocab_rules = (
-            "- Use plain, everyday language only.\n"
-            "- Do NOT use financial jargon: volatility, drawdown, momentum, valuation, diversification.\n"
-            "- Do NOT use numbers or percentages.\n"
-            "- Focus on intuitive reasons only.\n"
+            "Plain everyday language. No finance jargon (volatility, drawdown, momentum, valuation, diversification)."
         )
-        numeric_rules = "- Do NOT include any numbers.\n"
-
+        numeric_rules = "No numbers or percentages."
     elif exp_norm == "intermediate":
         n_bullets = 3
         vocab_rules = (
-            "- Use mostly plain language.\n"
-            "- You MAY use ONE basic finance term (volatility OR drawdown), explained intuitively.\n"
-            "- Avoid heavy jargon.\n"
-            "- Do NOT repeat beginner phrasing; add one extra nuance (comparison or limitation).\n"
+            "Mostly plain language. You may use ONE basic term (volatility OR drawdown) and explain it simply."
         )
-        numeric_rules = (
-            "- You MAY include at most ONE approximate numeric reference.\n"
-            "- Numbers must be rounded and explained in words (e.g. 'around 15% higher').\n"
-        )
-
+        numeric_rules = "At most ONE rounded number, explained in words."
     else:  # Advanced
         n_bullets = 4
-        vocab_rules = (
-            "- You SHOULD use analytical terms such as volatility, drawdown, and trend.\n"
-            "- Keep explanations precise and educational.\n"
-        )
-        numeric_rules = (
-            "- You SHOULD include 1–2 approximate numeric references where helpful.\n"
-            "- Numbers must be rounded and explained in words (e.g. 'roughly half the volatility').\n"
-        )
+        vocab_rules = "You may use analytical terms (volatility, drawdown, trend). Keep it educational and precise."
+        numeric_rules = "Include 1–2 rounded numbers where helpful, explained in words."
 
-    example_expl = [
-        f"{recommended_symbol} shows stronger expected upside than alternatives in this window.",
-        "Its price movements appear more stable compared to other assets.",
-        "Downside risk looks smaller based on historical worst drops.",
-        "Trend signals appear more supportive than peers over this period."
-    ][:n_bullets]
+    evidence_json = json.dumps(evidence, ensure_ascii=True)
+    ranking_json = json.dumps(final_ranking, ensure_ascii=True)
+    rec_json = json.dumps(recommended_symbol, ensure_ascii=True)
+    notes_json = json.dumps(ranker_notes, ensure_ascii=True)
 
+    # Tiny example (structure only) to reduce JSON parse failures
     example = {
-        "headline": f"{recommended_symbol} is the top-ranked long-term pick in this comparison.",
-        "explanation": example_expl,
-        "key_tradeoffs": [
-            "Expected upside versus stability.",
-            "Potential growth versus downside risk."
-        ],
-        "risks": [
-            "Historical patterns may not repeat in future markets.",
-            "Market conditions can change unexpectedly."
-        ],
+        "headline": f"{recommended_symbol} stands out in this comparison.",
+        "explanation": ["One sentence.", "One sentence."][:n_bullets],
+        "key_tradeoffs": ["One short tradeoff."],
+        "risks": ["One short risk.", "One short risk."],
         "disclaimer": "Educational only, not financial advice."
     }
+    example_json = json.dumps(example, ensure_ascii=True)
 
-    return f"""
-DATA (JSON):
-{json.dumps(evidence, ensure_ascii=True)}
-
-ROLE:
-You are an educational long-term investing assistant (NOT financial advice).
-Use ONLY the DATA. Do NOT add external facts.
-
-NON-NEGOTIABLE:
-- The Ranker already made the FINAL decision.
-- Explain WHY the top-ranked asset is ranked highest.
-- Treat "{recommended_symbol}" as the final top pick.
-- Do NOT re-rank assets.
-- Output ONE valid JSON object only (no markdown, no extra text).
-
-USER SETTINGS:
-experience_level={experience_level}
-
-HEADLINE RULES:
-- The headline MUST name the recommended symbol.
-- The headline may remain the same across experience levels.
-- Do NOT write phrases like "top pick" or "rank #1".
-
-EXPLANATION RULES (MANDATORY):
-- "explanation" MUST be a JSON array of strings.
-- Provide EXACTLY {n_bullets} explanation bullets.
-- Each bullet MUST focus on a DIFFERENT evidence dimension:
-  1) expected upside
-  2) stability / price swings
-  3) downside risk / worst drops
-  4) trend or momentum (if applicable)
-- Do NOT restate the same idea using different wording.
-- Each bullet must be ONE clear sentence.
-- Do NOT include literal "[" or "]" characters.
-
-METRIC TRANSLATION (MANDATORY):
-- NEVER print raw metric keys or labels anywhere (including inside sentences).
-- Forbidden strings (must not appear): forecast_change_pct, max_drawdown, trend_strength.
-- Use natural language terms instead:
-  - forecast_change_pct -> expected upside signal (stronger/weaker)
-  - volatility -> price swings / stability (more/less stable)
-  - max_drawdown -> worst drop / downside risk (bigger/smaller drawdowns)
-  - When discussing downside risk, compare worst drops using words like "smaller/larger worst drops" (do NOT say "half the time").
-  - trend_strength -> trend / momentum (more/less supportive)
-- If you would otherwise write a metric key, rewrite it using the natural language term.
-
-VOCABULARY RULES:
-{vocab_rules}
-
-NUMERIC RULES:
-{numeric_rules}
-
-FINAL RANKING (already decided):
-{json.dumps(final_ranking, ensure_ascii=True)}
-
-RECOMMENDED SYMBOL:
-{json.dumps(recommended_symbol, ensure_ascii=True)}
-
-OPTIONAL RANKER NOTES:
-{json.dumps(ranker_notes, ensure_ascii=True)}
-
-REQUIRED JSON SCHEMA:
-{{
-  "headline": "string",
-  "explanation": ["string", "..."],
-  "key_tradeoffs": ["string", "..."],
-  "risks": ["string", "..."],
-  "disclaimer": "Educational only, not financial advice."
-}}
-
-Example structure (follow format, not wording):
-{json.dumps(example, ensure_ascii=True)}
-""".strip()
-
+    return (
+        "TASK: Explain why the recommended asset is ranked highest, using ONLY the DATA.\n"
+        "You are educational only (NOT financial advice).\n\n"
+        "OUTPUT FORMAT (STRICT):\n"
+        "- Return EXACTLY ONE valid JSON object.\n"
+        "- No markdown, no ``` fences, no extra text before/after JSON.\n"
+        "- Use standard JSON double quotes only.\n"
+        "- Do not include trailing commas.\n\n"
+        f"experience_level={experience_level}\n"
+        f"recommended_symbol={rec_json}\n\n"
+        "DO NOT RE-RANK:\n"
+        "- The ranker already decided the final ranking.\n"
+        "- Treat recommended_symbol as final top pick.\n\n"
+        "EXPLANATION RULES:\n"
+        f"- explanation must be a JSON array with EXACTLY {n_bullets} strings.\n"
+        "- Each bullet must be ONE sentence.\n"
+        "- Each bullet must focus on a different dimension:\n"
+        "  1) expected upside\n"
+        "  2) stability / price swings\n"
+        "  3) downside risk / worst drops\n"
+        "  4) trend / momentum (only if bullet count allows)\n\n"
+        "METRIC TRANSLATION (STRICT):\n"
+        "- NEVER output raw metric keys anywhere.\n"
+        "- Forbidden strings: forecast_change_pct, max_drawdown, trend_strength.\n"
+        "- Use natural language:\n"
+        "  expected upside signal, stability/price swings, downside risk/worst drop, trend/momentum.\n\n"
+        f"VOCAB: {vocab_rules}\n"
+        f"NUMBERS: {numeric_rules}\n\n"
+        f"FINAL_RANKING: {ranking_json}\n"
+        f"RANKER_NOTES: {notes_json}\n\n"
+        "REQUIRED JSON KEYS:\n"
+        'headline (string), explanation (array of strings), key_tradeoffs (array), risks (array), disclaimer (string)\n\n'
+        f"EXAMPLE (structure only): {example_json}\n\n"
+        f"DATA: {evidence_json}"
+    )
 
 def normalize_explainer_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
     def _strip_wrapping_quotes(s: str) -> str:
@@ -628,6 +579,12 @@ def call_ollama_explainer_json(
     )
     prompt_chars = len(prompt)
 
+    exp = str((evidence.get("user_settings") or {})
+        .get("experience_level", "Beginner")
+        .strip()
+        .lower()
+    )  
+    num_predict = 450 if exp == "advanced" else 350
     payload = {
         "model": model,
         "prompt": prompt,
@@ -635,7 +592,7 @@ def call_ollama_explainer_json(
         "options": {
             "temperature": 0.0,
             "num_ctx": 1024,
-            "num_predict": 350
+            "num_predict": num_predict
         }
     }
 
@@ -655,6 +612,8 @@ def call_ollama_explainer_json(
 
         raw = (r.json().get("response", "") or "").strip()
         raw_clean = _sanitize_json_text(raw)
+        raw_clean = _strip_code_fences(raw_clean)
+        raw_clean = _remove_trailing_commas(raw_clean)
 
     except Exception as e:
         fallback = normalize_explainer_output({
@@ -666,20 +625,36 @@ def call_ollama_explainer_json(
         })
         return _with_prompt_chars(fallback, prompt_chars), str(e)
 
+    # 1) best attempt: extract first JSON object
     try:
         parsed = _extract_first_json_object(raw_clean)
         normalized = normalize_explainer_output(parsed)
-        return _with_prompt_chars(normalized, prompt_chars), raw
+        normalized["_prompt_chars"] = prompt_chars
+        return normalized, raw
     except Exception:
-        fallback = normalize_explainer_output({
-            "headline": "[Fallback] Explanation could not be generated reliably",
-            "explanation": ["LLM output parsing failed; try rerunning or changing the model."],
-            "key_tradeoffs": [],
-            "risks": [],
-            "disclaimer": "Educational only, not financial advice."
-        })
-        return _with_prompt_chars(fallback, prompt_chars), raw
+        pass
 
+    # 2) slice from first { to last }
+    start = raw_clean.find("{")
+    end = raw_clean.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(raw_clean[start:end + 1])
+            normalized = normalize_explainer_output(parsed)
+            normalized["_prompt_chars"] = prompt_chars
+            return normalized, raw
+        except Exception:
+            pass
+
+    # 3) if it starts with { but missing closing }, try to close it
+    if raw_clean.strip().startswith("{") and not raw_clean.strip().endswith("}"):
+        try:
+            parsed = json.loads(raw_clean.strip() + "\n}")
+            normalized = normalize_explainer_output(parsed)
+            normalized["_prompt_chars"] = prompt_chars
+            return normalized, raw
+        except Exception:
+            pass
 
 # ----------------------------
 # Public wrappers
