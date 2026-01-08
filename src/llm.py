@@ -331,7 +331,7 @@ def normalize_ranker_output(
 
 def call_ollama_ranker_json(
     evidence: Dict[str, Any],
-    model: str = "llama3.2:3b",
+    model: str = "llama3.2:1b",
     url: str = "http://localhost:11434/api/generate",
     timeout_s: int = 60
 ) -> Tuple[Dict[str, Any], str]:
@@ -430,8 +430,8 @@ def _make_explainer_prompt(
 
     # Tiny example (structure only) to reduce JSON parse failures
     example = {
-        "headline": f"{recommended_symbol} stands out in this comparison.",
-        "explanation": ["One sentence.", "One sentence."][:n_bullets],
+        "headline": "<headline mentioning symbol>",
+        "explanation": ["<bullet 1>", "<bullet 2>", "<bullet 3>", "<bullet 4>"][:n_bullets],
         "key_tradeoffs": ["One short tradeoff."],
         "risks": ["One short risk.", "One short risk."],
         "disclaimer": "Educational only, not financial advice."
@@ -464,6 +464,10 @@ def _make_explainer_prompt(
         "- Forbidden strings: forecast_change_pct, max_drawdown, trend_strength.\n"
         "- Use natural language:\n"
         "  expected upside signal, stability/price swings, downside risk/worst drop, trend/momentum.\n\n"
+        "IMPORTANT:\n"
+        "- Do NOT copy any text from the EXAMPLE.\n"
+        "- The EXAMPLE is structure-only.\n"
+        "- The literal phrase 'One sentence' MUST NOT appear.\n\n"
         f"VOCAB: {vocab_rules}\n"
         f"NUMBERS: {numeric_rules}\n\n"
         f"FINAL_RANKING: {ranking_json}\n"
@@ -567,7 +571,7 @@ def call_ollama_explainer_json(
     final_ranking: List[str],
     recommended_symbol: str,
     ranker_notes: Optional[List[str]] = None,
-    model: str = "llama3.2:3b",
+    model: str = "llama3.2:1b",
     url: str = "http://localhost:11434/api/generate",
     timeout_s: int = 180
 ) -> Tuple[Dict[str, Any], str]:
@@ -662,7 +666,7 @@ def call_ollama_explainer_json(
 
 def run_ranker_llm(
     evidence: Dict[str, Any],
-    model: str = "llama3.2:3b",
+    model: str = "llama3.2:1b",
 ) -> Tuple[Dict[str, Any], str]:
     return call_ollama_ranker_json(evidence, model=model)
 
@@ -670,7 +674,7 @@ def run_ranker_llm(
 def run_explainer_llm(
     final_ranking: List[str],
     evidence: Dict[str, Any],
-    model: str = "llama3.2:3b",
+    model: str = "llama3.2:1b",
     recommended_symbol: Optional[str] = None,
     ranker_notes: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, Any], str]:

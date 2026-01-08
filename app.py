@@ -15,7 +15,7 @@ from src.wallet import load_wallet, wallet_symbols
 # -----------------------------
 # App config
 # -----------------------------
-OLLAMA_MODEL = "llama3.2:3b"
+OLLAMA_MODEL = "llama3.2:1b"
 FORECAST_DAYS = 90
 
 st.set_page_config(page_title="FinanceBot", layout="wide")
